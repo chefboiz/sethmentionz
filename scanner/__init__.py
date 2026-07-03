@@ -16,7 +16,9 @@ def _within_window(end_date: str | None) -> bool:
     if not end_date:
         return False
     try:
-        dt  = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         return now <= dt <= now + timedelta(hours=RESOLUTION_WINDOW_HOURS)
     except ValueError:

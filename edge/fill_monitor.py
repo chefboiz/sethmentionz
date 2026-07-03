@@ -28,9 +28,11 @@ def run_fill_monitor() -> None:
         order_id  = trade['order_id']
         trade_id  = trade['id']
         market_id = trade['market_id']
-        approved  = datetime.fromisoformat(
-            str(trade['approved_at']).replace('Z', '+00:00')
-        )
+        raw      = trade['approved_at']
+        approved = (raw if isinstance(raw, datetime) else
+                    datetime.fromisoformat(str(raw).replace('Z', '+00:00')))
+        if approved.tzinfo is None:
+            approved = approved.replace(tzinfo=timezone.utc)
         timed_out = (now - approved) > timedelta(minutes=FILL_TIMEOUT_MINUTES)
 
         info    = get_order_status(order_id)

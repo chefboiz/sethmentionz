@@ -40,7 +40,9 @@ def _deadline_str(iso: str | None) -> str:
     if not iso:
         return '?'
     try:
-        dt   = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         mins = int((dt - datetime.now(timezone.utc)).total_seconds() / 60)
         if mins < 0:
             return 'past deadline'
