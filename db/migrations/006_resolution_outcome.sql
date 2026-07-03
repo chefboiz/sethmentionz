@@ -1,4 +1,4 @@
--- Run in Supabase SQL editor after 005_execution_fields.sql.
+-- Run via: bash db/migrate.sh   (runs all migrations in order)
 
 ALTER TABLE mention_markets
     ADD COLUMN IF NOT EXISTS resolution_outcome TEXT;   -- 'YES' | 'NO'

@@ -10,26 +10,14 @@ log = logging.getLogger(__name__)
 
 
 def run_fill_monitor() -> None:
-    """
-    Poll CLOB for fill status on all pending (status='approved') trades.
-    - Filled:     update to 'filled', log actuals, send Telegram confirmation.
-    - Timed out:  cancel the order, mark 'no_fill', send Telegram alert.
-    - Cancelled by CLOB: mark 'cancelled', send Telegram alert.
-    - Still live: update fill_checked_at timestamp, continue polling.
-    """
-    client  = db.get_client()
     now     = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
-    all_approved = (
-        client.table('mention_trades')
-        .select('id, market_id, order_id, size_usd, limit_price, approved_at')
-        .eq('status', 'approved')
-        .execute()
-    ).data or []
-
-    # Filter in Python — avoids PostgREST IS NOT NULL syntax edge cases
-    trades = [t for t in all_approved if t.get('order_id')]
+    trades = db.fetchall("""
+        SELECT id, market_id, order_id, size_usd, limit_price, approved_at
+        FROM mention_trades
+        WHERE status = 'approved' AND order_id IS NOT NULL
+    """)
 
     if not trades:
         return
@@ -41,28 +29,32 @@ def run_fill_monitor() -> None:
         trade_id  = trade['id']
         market_id = trade['market_id']
         approved  = datetime.fromisoformat(
-            trade['approved_at'].replace('Z', '+00:00')
+            str(trade['approved_at']).replace('Z', '+00:00')
         )
         timed_out = (now - approved) > timedelta(minutes=FILL_TIMEOUT_MINUTES)
 
-        info     = get_order_status(order_id)
-        status   = info['status']
-        matched  = info['size_matched']
-        avg_px   = info['avg_price']
+        info    = get_order_status(order_id)
+        status  = info['status']
+        matched = info['size_matched']
+        avg_px  = info['avg_price']
 
         if matched > 0 or status == 'matched':
             fill_usd = round(matched * avg_px, 2) if avg_px else round(
                 matched * float(trade.get('limit_price') or 0), 2
             )
-            client.table('mention_trades').update({
-                'status':          'filled',
-                'fill_price':      avg_px,
-                'fill_shares':     matched,
-                'fill_size_usd':   fill_usd,
-                'fill_checked_at': now_iso,
-            }).eq('id', trade_id).execute()
+            db.execute("""
+                UPDATE mention_trades SET
+                    status          = 'filled',
+                    fill_price      = %(fill_price)s,
+                    fill_shares     = %(fill_shares)s,
+                    fill_size_usd   = %(fill_size_usd)s,
+                    fill_checked_at = %(now)s
+                WHERE id = %(id)s
+            """, {'fill_price': avg_px, 'fill_shares': matched,
+                  'fill_size_usd': fill_usd, 'now': now_iso, 'id': trade_id})
 
-            log.info('Filled: trade=%s  %.2f shares @ %.4f  ($%.2f)', trade_id, matched, avg_px, fill_usd)
+            log.info('Filled: trade=%s  %.2f shares @ %.4f  ($%.2f)',
+                     trade_id, matched, avg_px, fill_usd)
             tg.send_message(
                 f'✅ <b>Order filled</b>\n'
                 f'Market: <code>{market_id[:16]}</code>\n'
@@ -70,11 +62,13 @@ def run_fill_monitor() -> None:
             )
 
         elif status == 'canceled':
-            client.table('mention_trades').update({
-                'status':          'cancelled',
-                'cancelled_at':    now_iso,
-                'fill_checked_at': now_iso,
-            }).eq('id', trade_id).execute()
+            db.execute("""
+                UPDATE mention_trades SET
+                    status          = 'cancelled',
+                    cancelled_at    = %(now)s,
+                    fill_checked_at = %(now)s
+                WHERE id = %(id)s
+            """, {'now': now_iso, 'id': trade_id})
 
             log.info('Order cancelled by CLOB: trade=%s', trade_id)
             tg.send_message(
@@ -85,11 +79,13 @@ def run_fill_monitor() -> None:
 
         elif status == 'live' and timed_out:
             cancel_order(order_id)
-            client.table('mention_trades').update({
-                'status':          'no_fill',
-                'cancelled_at':    now_iso,
-                'fill_checked_at': now_iso,
-            }).eq('id', trade_id).execute()
+            db.execute("""
+                UPDATE mention_trades SET
+                    status          = 'no_fill',
+                    cancelled_at    = %(now)s,
+                    fill_checked_at = %(now)s
+                WHERE id = %(id)s
+            """, {'now': now_iso, 'id': trade_id})
 
             log.info('Order timed out, cancelled: trade=%s', trade_id)
             tg.send_message(
@@ -99,7 +95,6 @@ def run_fill_monitor() -> None:
             )
 
         else:
-            # Still live, within timeout — just bump the check timestamp
-            client.table('mention_trades').update({
-                'fill_checked_at': now_iso,
-            }).eq('id', trade_id).execute()
+            db.execute("""
+                UPDATE mention_trades SET fill_checked_at = %s WHERE id = %s
+            """, (now_iso, trade_id))

@@ -30,10 +30,6 @@ def _parse_outcomes(val) -> list[str]:
 
 
 def _resolve_from_prices(outcomes: list[str], prices: list[float]) -> str | None:
-    """
-    Return 'YES' or 'NO' based on which outcome price resolved to ~1.0.
-    Polymarket sets the winning side to 1.0 and losing side to 0.0 on resolution.
-    """
     for i, p in enumerate(prices):
         if p >= 0.99:
             label = str(outcomes[i]).upper() if i < len(outcomes) else ''
@@ -55,35 +51,21 @@ def _fetch_market(market_id: str) -> dict | None:
 
 
 def run_resolution_check() -> None:
-    """
-    For each unresolved mention market that has at least one trade, check the Gamma API
-    for resolution. On resolution, store the outcome and mark every trade as won/lost.
-    """
     log.info('=== Resolution check started ===')
-    client = db.get_client()
 
     # Markets that have trades but aren't marked resolved
-    unresolved = (
-        client.table('mention_markets')
-        .select('market_id')
-        .eq('resolved', False)
-        .execute()
-    ).data or []
+    unresolved = db.fetchall("""
+        SELECT DISTINCT mm.market_id
+        FROM mention_markets mm
+        JOIN mention_trades mt ON mt.market_id = mm.market_id
+        WHERE mm.resolved = FALSE
+    """)
 
-    traded_ids = {
-        r['market_id'] for r in (
-            client.table('mention_trades')
-            .select('market_id')
-            .execute()
-        ).data or []
-    }
-
-    to_check = [m['market_id'] for m in unresolved if m['market_id'] in traded_ids]
-
-    if not to_check:
+    if not unresolved:
         log.info('No unresolved traded markets')
         return
 
+    to_check = [r['market_id'] for r in unresolved]
     log.info('Checking %d market(s)', len(to_check))
     resolved_n = 0
 
@@ -105,26 +87,27 @@ def run_resolution_check() -> None:
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        client.table('mention_markets').update({
-            'resolved':           True,
-            'resolution_outcome': outcome,
-            'last_updated':       now_iso,
-        }).eq('market_id', mid).execute()
+        db.execute("""
+            UPDATE mention_markets SET
+                resolved           = TRUE,
+                resolution_outcome = %s,
+                last_updated       = %s
+            WHERE market_id = %s
+        """, (outcome, now_iso, mid))
 
-        trades = (
-            client.table('mention_trades')
-            .select('id, side')
-            .eq('market_id', mid)
-            .execute()
-        ).data or []
+        trades = db.fetchall("""
+            SELECT id, side FROM mention_trades WHERE market_id = %s
+        """, (mid,))
 
         for trade in trades:
             won = (str(trade.get('side', 'YES')).upper() == outcome)
-            client.table('mention_trades').update({
-                'actual_outcome': outcome,
-                'won':            won,
-                'resolved_at':    now_iso,
-            }).eq('id', trade['id']).execute()
+            db.execute("""
+                UPDATE mention_trades SET
+                    actual_outcome = %s,
+                    won            = %s,
+                    resolved_at    = %s
+                WHERE id = %s
+            """, (outcome, won, now_iso, trade['id']))
 
         resolved_n += 1
         log.info('Resolved: %s → %s  (%d trade(s) updated)', mid[:14], outcome, len(trades))

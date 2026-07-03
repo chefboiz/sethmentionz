@@ -1,4 +1,4 @@
--- Run in Supabase SQL editor after 002_mention_signals.sql.
+-- Run via: bash db/migrate.sh   (runs all migrations in order)
 
 CREATE TABLE IF NOT EXISTS mention_opportunities (
     market_id               TEXT PRIMARY KEY REFERENCES mention_markets(market_id),

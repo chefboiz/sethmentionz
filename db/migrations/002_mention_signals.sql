@@ -1,4 +1,4 @@
--- Run this in the Supabase SQL editor after 001_mention_markets.sql.
+-- Run via: bash db/migrate.sh   (runs all migrations in order)
 
 CREATE TABLE IF NOT EXISTS mention_signals (
     id                      BIGSERIAL PRIMARY KEY,

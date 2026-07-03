@@ -5,8 +5,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN       = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID         = os.getenv('TELEGRAM_CHAT_ID', '')
-SUPABASE_URL             = os.getenv('SUPABASE_URL', '')
-SUPABASE_KEY             = os.getenv('SUPABASE_KEY', '')
+DATABASE_URL             = os.getenv('DATABASE_URL', '')
 ANTHROPIC_API_KEY        = os.getenv('ANTHROPIC_API_KEY', '')
 NEWS_API_KEY             = os.getenv('NEWS_API_KEY', '')
 

@@ -1,4 +1,4 @@
--- Run in Supabase SQL editor after 003_mention_opportunities.sql.
+-- Run via: bash db/migrate.sh   (runs all migrations in order)
 
 -- Re-alert tracking + message reference on the opportunity row
 ALTER TABLE mention_opportunities

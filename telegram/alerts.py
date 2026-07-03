@@ -8,9 +8,9 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 log = logging.getLogger(__name__)
 
-REALERT_THRESHOLD = 0.02   # 2pp — re-alert when edge or confidence moves more than this
+REALERT_THRESHOLD = 0.02   # re-alert when edge or confidence moves more than 2pp
 
-# ── Callback registry ────────────────────────────────────────────────────────
+# ── Callback registry ─────────────────────────────────────────────────────────
 # Telegram callback_data is limited to 64 bytes.
 # We map each market_id to a short int key and embed that in the button payload.
 
@@ -25,8 +25,8 @@ def register_market(market_id: str) -> str:
         return _rev[market_id]
     _counter += 1
     key = str(_counter)
-    _fwd[key]         = market_id
-    _rev[market_id]   = key
+    _fwd[key]       = market_id
+    _rev[market_id] = key
     return key
 
 
@@ -34,20 +34,20 @@ def resolve_market(short_id: str) -> str | None:
     return _fwd.get(short_id)
 
 
-# ── Alert formatting ─────────────────────────────────────────────────────────
+# ── Alert formatting ──────────────────────────────────────────────────────────
 
 def _deadline_str(iso: str | None) -> str:
     if not iso:
         return '?'
     try:
-        dt   = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+        dt   = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
         mins = int((dt - datetime.now(timezone.utc)).total_seconds() / 60)
         if mins < 0:
             return 'past deadline'
         h, m = divmod(mins, 60)
         return f'{h}h {m}m' if h else f'{m}m'
     except ValueError:
-        return iso[:16]
+        return str(iso)[:16]
 
 
 def _build_text(opp: dict, market: dict) -> str:
@@ -80,7 +80,6 @@ def _build_text(opp: dict, market: dict) -> str:
 
 
 def send_alert(opp: dict, market: dict) -> int | None:
-    """Send the opportunity alert with inline keyboard. Returns message_id or None."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning('Telegram not configured — skipping alert')
         return None
@@ -120,44 +119,46 @@ def send_alert(opp: dict, market: dict) -> int | None:
         return None
 
 
-# ── APScheduler job ──────────────────────────────────────────────────────────
+# ── APScheduler job ───────────────────────────────────────────────────────────
 
 def run_alert_check() -> None:
-    client  = db.get_client()
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # 1. New unalerted opportunities
-    new_opps = (
-        client.table('mention_opportunities')
-        .select('*, mention_markets(question, subject, context, resolution_deadline)')
-        .eq('status', 'pending')
-        .eq('alerted', False)
-        .execute()
-    ).data or []
+    new_opps = db.fetchall("""
+        SELECT mo.*, mm.question, mm.subject, mm.context, mm.resolution_deadline
+        FROM mention_opportunities mo
+        JOIN mention_markets mm ON mm.market_id = mo.market_id
+        WHERE mo.status = 'pending' AND mo.alerted = FALSE
+    """)
 
     for row in new_opps:
-        market = row.pop('mention_markets', {}) or {}
+        market = {k: row[k] for k in ('question', 'subject', 'context', 'resolution_deadline')}
+        opp    = {k: v for k, v in row.items() if k not in market}
         mid    = row['market_id']
-        msg_id = send_alert(row, market)
+        msg_id = send_alert(opp, market)
 
-        upd = {
-            'alerted':            True,
-            'alerted_edge_pct':   row.get('edge_pct'),
-            'alerted_confidence': row.get('blended_confidence'),
-        }
-        if msg_id:
-            upd['tg_message_id'] = msg_id
-
-        client.table('mention_opportunities').update(upd).eq('market_id', mid).execute()
+        db.execute("""
+            UPDATE mention_opportunities SET
+                alerted            = TRUE,
+                alerted_edge_pct   = %(edge_pct)s,
+                alerted_confidence = %(blended_confidence)s,
+                tg_message_id      = %(tg_message_id)s
+            WHERE market_id = %(market_id)s
+        """, {
+            'edge_pct':           row.get('edge_pct'),
+            'blended_confidence': row.get('blended_confidence'),
+            'tg_message_id':      msg_id,
+            'market_id':          mid,
+        })
 
     # 2. Re-alert if edge or confidence has moved >2pp since last alert
-    alerted = (
-        client.table('mention_opportunities')
-        .select('market_id, edge_pct, blended_confidence, alerted_edge_pct, alerted_confidence')
-        .eq('status', 'pending')
-        .eq('alerted', True)
-        .execute()
-    ).data or []
+    alerted = db.fetchall("""
+        SELECT market_id, edge_pct, blended_confidence,
+               alerted_edge_pct, alerted_confidence
+        FROM mention_opportunities
+        WHERE status = 'pending' AND alerted = TRUE
+    """)
 
     for row in alerted:
         prev_edge = row.get('alerted_edge_pct')
@@ -172,8 +173,8 @@ def run_alert_check() -> None:
         )
 
         if edge_moved or conf_moved:
-            client.table('mention_opportunities') \
-                .update({'alerted': False}) \
-                .eq('market_id', row['market_id']) \
-                .execute()
+            db.execute("""
+                UPDATE mention_opportunities SET alerted = FALSE
+                WHERE market_id = %s
+            """, (row['market_id'],))
             log.info('Re-alert queued: %s (moved >2pp)', row['market_id'][:14])

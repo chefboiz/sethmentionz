@@ -1,4 +1,4 @@
--- Run this in the Supabase SQL editor before starting Phase 1.
+-- Run via: bash db/migrate.sh   (or: psql $DATABASE_URL -f db/migrations/001_mention_markets.sql)
 
 CREATE TABLE IF NOT EXISTS mention_markets (
     market_id                   TEXT PRIMARY KEY,

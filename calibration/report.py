@@ -19,7 +19,6 @@ from config import LLM_WEIGHT, SIGNAL_WEIGHT
 
 log = logging.getLogger(__name__)
 
-# Bucket lower boundaries (the last value is the open-ended upper limit)
 _BUCKETS = [
     (0.94, 0.95),
     (0.95, 0.96),
@@ -35,17 +34,12 @@ def _bucket_label(lo: float, hi: float) -> str:
 
 
 def build_report() -> str:
-    client = db.get_client()
-
-    all_trades = (
-        client.table('mention_trades')
-        .select('market_id, confidence, llm_score:mention_signals(llm_score), '
-                'won, actual_outcome, size_usd, approved_at')
-        .execute()
-    ).data or []
-
-    # Filter resolved trades in Python to avoid PostgREST IS NOT NULL quirks
-    trades = [t for t in all_trades if t.get('won') is not None]
+    trades = db.fetchall("""
+        SELECT t.market_id, t.confidence, t.won, t.actual_outcome, t.size_usd, t.approved_at
+        FROM mention_trades t
+        WHERE t.won IS NOT NULL
+        ORDER BY t.approved_at DESC
+    """)
 
     if not trades:
         return (
@@ -54,9 +48,9 @@ def build_report() -> str:
             'Check back after markets start resolving.'
         )
 
-    total    = len(trades)
-    wins     = sum(1 for t in trades if t.get('won'))
-    overall  = wins / total * 100
+    total   = len(trades)
+    wins    = sum(1 for t in trades if t.get('won'))
+    overall = wins / total * 100
 
     lines = [
         '📊 <b>Calibration Report</b>',
@@ -85,32 +79,30 @@ def build_report() -> str:
     if not any_bucket:
         lines.append('<i>No trades fall within confidence thresholds yet</i>')
 
-    # Per-leg summary using mention_signals (if available)
-    signals = (
-        client.table('mention_signals')
-        .select('market_id, llm_score, signal_score, blended_score')
-        .execute()
-    ).data or []
+    # Per-leg summary using latest signal per resolved trade market
+    trade_mids = list({t['market_id'] for t in trades})
+    if trade_mids:
+        signals = db.fetchall("""
+            SELECT DISTINCT ON (market_id) market_id, llm_score, signal_score
+            FROM mention_signals
+            WHERE market_id = ANY(%s)
+            ORDER BY market_id, scored_at DESC
+        """, (trade_mids,))
 
-    if signals and trades:
-        # Match latest signal per market to resolved trade
-        latest: dict[str, dict] = {}
-        for s in signals:
-            mid = s['market_id']
-            if mid not in latest:
-                latest[mid] = s
+        if signals:
+            latest = {s['market_id']: s for s in signals}
+            matched = [(t, latest[t['market_id']]) for t in trades if t['market_id'] in latest]
 
-        matched = [(t, latest[t['market_id']]) for t in trades if t['market_id'] in latest]
-        if matched:
-            avg_llm    = sum(float(s.get('llm_score') or 0) for _, s in matched) / len(matched)
-            avg_signal = sum(float(s.get('signal_score') or 0) for _, s in matched) / len(matched)
-            lines += [
-                '',
-                '<b>Leg averages (matched resolved trades)</b>',
-                f'LLM leg avg predicted:    <b>{avg_llm*100:.1f}%</b>',
-                f'Signal leg avg:           <b>{avg_signal*100:.1f}%</b>',
-                f'Actual win rate:          <b>{overall:.0f}%</b>',
-            ]
+            if matched:
+                avg_llm    = sum(float(s.get('llm_score') or 0) for _, s in matched) / len(matched)
+                avg_signal = sum(float(s.get('signal_score') or 0) for _, s in matched) / len(matched)
+                lines += [
+                    '',
+                    '<b>Leg averages (matched resolved trades)</b>',
+                    f'LLM leg avg predicted:    <b>{avg_llm*100:.1f}%</b>',
+                    f'Signal leg avg:           <b>{avg_signal*100:.1f}%</b>',
+                    f'Actual win rate:          <b>{overall:.0f}%</b>',
+                ]
 
     lines += [
         '',
@@ -123,7 +115,6 @@ def build_report() -> str:
 
 
 def _split_4096(text: str) -> list[str]:
-    """Split a message into Telegram-safe chunks."""
     chunks, buf = [], ''
     for line in text.split('\n'):
         if len(buf) + len(line) + 1 > 4000:

@@ -1,4 +1,4 @@
--- Run in Supabase SQL editor after 004_mention_trades.sql.
+-- Run via: bash db/migrate.sh   (runs all migrations in order)
 
 ALTER TABLE mention_trades
     ADD COLUMN IF NOT EXISTS order_id        TEXT,

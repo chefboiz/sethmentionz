@@ -38,7 +38,7 @@ log = logging.getLogger('sethmentionz')
 def main() -> None:
     log.info('SethMentionz starting up')
 
-    db.get_client()
+    db.get_pool()
 
     paused_note = '  [TRADING PAUSED]' if trading_state.is_paused() else ''
     tg.send_message(f'SethMentionz online{paused_note}')
