@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "pm2-runtime start ecosystem.config.js"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
