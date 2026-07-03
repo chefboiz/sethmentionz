@@ -14,7 +14,8 @@ REALERT_THRESHOLD = 0.02
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def get_open_opportunity() -> dict | None:
-    """Return the currently open (awaiting reply) opportunity, or None."""
+    """Return the currently open (awaiting reply) opportunity, or None.
+    Open = status 'pending' + alerted TRUE (alert was sent, reply not yet received)."""
     return db.fetchone("""
         SELECT mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
                mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag, mo.status,
@@ -23,11 +24,12 @@ def get_open_opportunity() -> dict | None:
                mm.description, mm.clob_token_ids
         FROM mention_opportunities mo
         JOIN mention_markets mm ON mm.market_id = mo.market_id
-        WHERE mo.queue_status = 'open'
+        WHERE mo.status = 'pending' AND mo.alerted = TRUE
     """)
 
 
 def _get_next_queued() -> dict | None:
+    """Next pending+unalerted opportunity ordered by when it qualified."""
     return db.fetchone("""
         SELECT mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
                mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag,
@@ -35,17 +37,15 @@ def _get_next_queued() -> dict | None:
                mm.resolution_deadline, mm.clob_token_ids
         FROM mention_opportunities mo
         JOIN mention_markets mm ON mm.market_id = mo.market_id
-        WHERE mo.queue_status = 'queued'
-        ORDER BY mo.queued_at ASC
+        WHERE mo.status = 'pending' AND mo.alerted = FALSE
+        ORDER BY mo.qualified_at ASC
         LIMIT 1
     """)
 
 
 def skip_opp(market_id: str) -> None:
     db.execute("""
-        UPDATE mention_opportunities
-        SET status = 'skipped', queue_status = NULL
-        WHERE market_id = %s
+        UPDATE mention_opportunities SET status = 'skipped' WHERE market_id = %s
     """, (market_id,))
 
 
@@ -152,7 +152,6 @@ def _open_opp(opp: dict) -> None:
     msg_id = send_alert(opp)
     db.execute("""
         UPDATE mention_opportunities SET
-            queue_status       = 'open',
             alerted            = TRUE,
             alerted_edge_pct   = %(edge_pct)s,
             alerted_confidence = %(blended_confidence)s,
@@ -164,7 +163,7 @@ def _open_opp(opp: dict) -> None:
         'tg_message_id':      msg_id,
         'market_id':          mid,
     })
-    log.info('Opened queued opportunity: %s', mid[:14])
+    log.info('Opened: %s', mid[:14])
 
 
 def advance_queue() -> None:
@@ -180,54 +179,30 @@ def advance_queue() -> None:
 # ── APScheduler job ───────────────────────────────────────────────────────────
 
 def run_alert_check() -> None:
-    # 1. Check whether the currently open opportunity has gone stale
-    open_opp = get_open_opportunity()
-    if open_opp:
-        if open_opp['status'] == 'expired':
-            mid = open_opp['market_id']
-            q   = (open_opp.get('question') or mid)[:60]
-            log.info('Auto-skipping expired open opportunity: %s', mid[:14])
-            send_message(f'⏭ Auto-skipped "{q}" — edge closed or price ceiling hit')
-            skip_opp(mid)
-            advance_queue()
-        else:
-            # Still valid — wait for reply before queuing more
-            return
-
-    # 2. Queue new qualifying, unqueued opportunities
-    candidates = db.fetchall("""
-        SELECT mo.market_id, mo.blended_confidence, mo.edge_pct,
-               mo.alerted, mo.alerted_edge_pct, mo.alerted_confidence
+    # 1. Notify about any open opportunity that price_refresh already expired.
+    #    Detect via: status='expired' AND alerted=TRUE AND tg_message_id IS NOT NULL.
+    #    Clear tg_message_id after notifying so we don't repeat the message.
+    expired_open = db.fetchone("""
+        SELECT mo.market_id, mm.question
         FROM mention_opportunities mo
-        WHERE mo.status = 'pending'
-          AND mo.queue_status IS NULL
-        ORDER BY mo.qualified_at ASC
+        JOIN mention_markets mm ON mm.market_id = mo.market_id
+        WHERE mo.status = 'expired' AND mo.alerted = TRUE AND mo.tg_message_id IS NOT NULL
+        LIMIT 1
     """)
-
-    for row in candidates:
-        mid         = row['market_id']
-        was_alerted = row.get('alerted', False)
-        prev_edge   = row.get('alerted_edge_pct')
-        prev_conf   = row.get('alerted_confidence')
-
-        if was_alerted and prev_edge is not None:
-            edge_moved = abs(float(row['edge_pct']) - float(prev_edge)) > REALERT_THRESHOLD
-            conf_moved = (
-                prev_conf is not None
-                and abs(float(row['blended_confidence']) - float(prev_conf)) > REALERT_THRESHOLD
-            )
-            if not (edge_moved or conf_moved):
-                continue
-
+    if expired_open:
+        q = (expired_open.get('question') or expired_open['market_id'])[:60]
+        log.info('Auto-skip notification: %s', expired_open['market_id'][:14])
+        send_message(f'⏭ Auto-skipped "{q}" — edge closed or price ceiling hit')
         db.execute("""
-            UPDATE mention_opportunities
-            SET queued_at = %s, queue_status = 'queued'
+            UPDATE mention_opportunities SET tg_message_id = NULL
             WHERE market_id = %s
-        """, (datetime.now(timezone.utc).isoformat(), mid))
-        log.info('Queued: %s', mid[:14])
+        """, (expired_open['market_id'],))
 
-    # 3. If nothing is open, open the next in queue
-    if not get_open_opportunity():
-        nxt = _get_next_queued()
-        if nxt:
-            _open_opp(nxt)
+    # 2. If something is still open and pending, wait for the user's reply.
+    if get_open_opportunity():
+        return
+
+    # 3. Nothing open — open the next in queue (pending+alerted=FALSE, oldest first).
+    nxt = _get_next_queued()
+    if nxt:
+        _open_opp(nxt)

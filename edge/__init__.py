@@ -74,7 +74,6 @@ def run_edge() -> None:
                 total_depth_usd     = EXCLUDED.total_depth_usd,
                 liquidity_flag      = EXCLUDED.liquidity_flag,
                 status              = 'pending',
-                alerted             = FALSE,
                 last_price_check_at = EXCLUDED.last_price_check_at
         """, {
             'market_id':           mid,

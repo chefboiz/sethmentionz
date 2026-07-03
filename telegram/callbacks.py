@@ -84,7 +84,7 @@ def _handle_y(opp: dict, amount: float, chat_id: str) -> None:
         _log_trade(market_id, amount, chat_id, status='approved_dry_run')
         db.execute("""
             UPDATE mention_opportunities
-            SET status = 'approved', queue_status = NULL
+            SET status = 'approved'
             WHERE market_id = %s
         """, (market_id,))
         _send(chat_id,
@@ -111,7 +111,7 @@ def _handle_y(opp: dict, amount: float, chat_id: str) -> None:
                    status='approved', order_id=order_id, limit_price=limit_price)
         db.execute("""
             UPDATE mention_opportunities
-            SET status = 'approved', queue_status = NULL
+            SET status = 'approved'
             WHERE market_id = %s
         """, (market_id,))
         _send(chat_id,
