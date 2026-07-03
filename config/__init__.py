@@ -21,7 +21,7 @@ EDGE_MAX_PRICE           = float(os.getenv('EDGE_MAX_PRICE', '0.96'))
 MIN_VIABLE_SIZE_USD      = float(os.getenv('MIN_VIABLE_SIZE_USD', '50'))
 LIQUIDITY_THRESHOLD_USD  = float(os.getenv('LIQUIDITY_THRESHOLD_USD', '200'))
 
-CONFIDENCE_THRESHOLD     = float(os.getenv('CONFIDENCE_THRESHOLD', '0.94'))
+CONFIDENCE_THRESHOLD     = float(os.getenv('CONFIDENCE_THRESHOLD', '0.75'))
 
 ALERT_CHECK_SECONDS      = int(os.getenv('ALERT_CHECK_SECONDS', '60'))
 CALLBACK_POLL_SECONDS    = int(os.getenv('CALLBACK_POLL_SECONDS', '5'))

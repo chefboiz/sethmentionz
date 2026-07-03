@@ -6,15 +6,19 @@ import httpx
 import db
 import trading_state
 from config import TELEGRAM_BOT_TOKEN
-from telegram.alerts import resolve_market
+from telegram.alerts import (
+    get_open_opportunity,
+    advance_queue,
+    skip_opp,
+    resolve_dt_str,
+)
 
 log = logging.getLogger(__name__)
 
-_state: dict                   = {'last_update_id': 0}
-_awaiting_size: dict[str, str] = {}   # str(chat_id) -> market_id
+_state: dict = {'last_update_id': 0}
 
 
-# ── Low-level Telegram helpers ────────────────────────────────────────────────
+# ── Low-level send ────────────────────────────────────────────────────────────
 
 def _send(chat_id, text: str) -> None:
     if not TELEGRAM_BOT_TOKEN:
@@ -23,36 +27,13 @@ def _send(chat_id, text: str) -> None:
         with httpx.Client(timeout=8) as c:
             c.post(
                 f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
-                json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'},
+                json={'chat_id': chat_id, 'text': text},
             )
     except Exception as e:
         log.error('sendMessage error: %s', e)
 
 
-def _ack(callback_query_id: str, text: str = '') -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    try:
-        with httpx.Client(timeout=5) as c:
-            c.post(
-                f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery',
-                json={'callback_query_id': callback_query_id, 'text': text},
-            )
-    except Exception:
-        pass
-
-
-# ── Trade helpers ─────────────────────────────────────────────────────────────
-
-def _snapshot_opp(market_id: str) -> dict:
-    return db.fetchone("""
-        SELECT mo.max_size_usd, mo.best_ask, mo.blended_confidence, mo.edge_pct,
-               mm.clob_token_ids, mm.question
-        FROM mention_opportunities mo
-        JOIN mention_markets mm ON mm.market_id = mo.market_id
-        WHERE mo.market_id = %s
-    """, (market_id,)) or {}
-
+# ── Trade logging ─────────────────────────────────────────────────────────────
 
 def _log_trade(market_id: str, size_usd: float, chat_id: str,
                status: str = 'approved_dry_run',
@@ -60,8 +41,7 @@ def _log_trade(market_id: str, size_usd: float, chat_id: str,
                limit_price: float | None = None) -> int | None:
     snap = db.fetchone("""
         SELECT best_ask, blended_confidence, edge_pct
-        FROM mention_opportunities
-        WHERE market_id = %s
+        FROM mention_opportunities WHERE market_id = %s
     """, (market_id,)) or {}
 
     row = db.insert_returning("""
@@ -74,202 +54,171 @@ def _log_trade(market_id: str, size_usd: float, chat_id: str,
         )
         RETURNING id
     """, {
-        'market_id':       market_id,
-        'size_usd':        size_usd,
-        'price':           snap.get('best_ask'),
-        'confidence':      snap.get('blended_confidence'),
-        'edge_pct':        snap.get('edge_pct'),
-        'status':          status,
+        'market_id':        market_id,
+        'size_usd':         size_usd,
+        'price':            snap.get('best_ask'),
+        'confidence':       snap.get('blended_confidence'),
+        'edge_pct':         snap.get('edge_pct'),
+        'status':           status,
         'telegram_chat_id': str(chat_id),
-        'order_id':        order_id,
-        'limit_price':     limit_price,
-        'approved_at':     datetime.now(timezone.utc).isoformat(),
+        'order_id':         order_id,
+        'limit_price':      limit_price,
+        'approved_at':      datetime.now(timezone.utc).isoformat(),
     })
     return row['id'] if row else None
 
 
-# ── Button callback handler ───────────────────────────────────────────────────
+# ── Reply handlers ────────────────────────────────────────────────────────────
 
-def _handle_callback(update: dict) -> None:
-    cq      = update['callback_query']
-    cq_id   = cq['id']
-    data    = cq.get('data', '')
-    chat_id = cq['message']['chat']['id']
+def _handle_y(opp: dict, amount: float, chat_id: str) -> None:
+    market_id   = opp['market_id']
+    best_ask    = float(opp.get('best_ask') or 0)
+    confidence  = float(opp.get('blended_confidence') or 0)
+    q           = (opp.get('question') or market_id)[:80]
+    clob_ids    = opp.get('clob_token_ids') or []
+    payout      = round(amount / best_ask, 2) if best_ask else 0.0
+    resolve_str = resolve_dt_str(opp.get('resolution_deadline'))
 
-    if ':' not in data:
-        return
-
-    action, short_id = data.split(':', 1)
-    market_id = resolve_market(short_id)
-
-    if market_id is None:
-        _ack(cq_id, 'Unknown — registry cleared on restart')
-        return
-
-    # ── Approve ───────────────────────────────────────────────────────────────
-    if action == 'a':
-        opp        = _snapshot_opp(market_id)
-        size       = float(opp.get('max_size_usd') or 50)
-        best_ask   = float(opp.get('best_ask') or 0)
-        confidence = float(opp.get('blended_confidence') or 0)
-        edge       = float(opp.get('edge_pct') or 0)
-        q          = (opp.get('question') or market_id)[:80]
-        clob_ids   = opp.get('clob_token_ids') or []
-
-        if trading_state.is_paused() or not clob_ids:
-            reason = 'paused' if trading_state.is_paused() else 'no token ID'
-            _log_trade(market_id, size, chat_id, status='approved_dry_run')
-            db.execute("""
-                UPDATE mention_opportunities SET status = 'approved' WHERE market_id = %s
-            """, (market_id,))
-            _ack(cq_id, '✅ Logged (dry-run)')
-            _send(chat_id,
-                  f'✅ <b>DRY RUN</b> ({reason})\n\n'
-                  f'{q}\n\n'
-                  f'Size: <b>${size:.0f}</b>  •  Ask: {best_ask:.3f}  •  Edge: +{edge*100:.1f}%\n'
-                  f'<i>Use /resume to enable live trading</i>')
-            log.info('Approved dry-run (%s): %s  $%.0f', reason, market_id[:14], size)
-            return
-
-        try:
-            from edge.executor import place_order
-            result      = place_order(
-                token_id=clob_ids[0],
-                size_usd=size,
-                best_ask=best_ask,
-                blended_confidence=confidence,
-            )
-            order_id    = result['order_id']
-            limit_price = result['limit_price']
-
-            _log_trade(market_id, size, chat_id,
-                       status='approved', order_id=order_id, limit_price=limit_price)
-            db.execute("""
-                UPDATE mention_opportunities SET status = 'approved' WHERE market_id = %s
-            """, (market_id,))
-
-            _ack(cq_id, '✅ Order placed')
-            _send(chat_id,
-                  f'✅ <b>Order placed</b>\n\n'
-                  f'{q}\n\n'
-                  f'Limit: <b>{limit_price:.3f}</b>  •  Size: <b>${size:.0f}</b>  •  Edge: +{edge*100:.1f}%\n'
-                  f'Order: <code>{order_id[:20]}</code>\n'
-                  f'<i>Fill monitor polling every 30s</i>')
-            log.info('Order placed: %s  $%.0f @ %.3f', market_id[:14], size, limit_price)
-
-        except Exception as e:
-            log.error('Execution error for %s: %s', market_id[:14], e)
-            _log_trade(market_id, size, chat_id, status='approved_dry_run')
-            _ack(cq_id, '⚠️ Execution failed — dry-run logged')
-            _send(chat_id,
-                  f'⚠️ <b>Execution failed — dry-run logged</b>\n'
-                  f'<code>{str(e)[:200]}</code>')
-
-    # ── Skip ──────────────────────────────────────────────────────────────────
-    elif action == 's':
+    if trading_state.is_paused() or not clob_ids:
+        reason = 'paused' if trading_state.is_paused() else 'no token ID'
+        _log_trade(market_id, amount, chat_id, status='approved_dry_run')
         db.execute("""
-            UPDATE mention_opportunities SET status = 'skipped' WHERE market_id = %s
+            UPDATE mention_opportunities
+            SET status = 'approved', queue_status = NULL
+            WHERE market_id = %s
         """, (market_id,))
-        _ack(cq_id, 'Skipped')
-        _send(chat_id, f'❌ Skipped <code>{market_id[:16]}</code>')
-        log.info('Skipped: %s', market_id[:14])
+        _send(chat_id,
+              f'✅ Trade Placed (dry-run — {reason}) — 🟢 YES · "{q}"\n\n'
+              f'💵 Amount: ${amount:.0f}\n'
+              f'📈 To return: ${payout:.2f}\n'
+              f'⏱ Resolves: {resolve_str}')
+        log.info('Dry-run trade (%s): %s  $%.0f', reason, market_id[:14], amount)
+        advance_queue()
+        return
 
-    # ── Approve smaller ───────────────────────────────────────────────────────
-    elif action == 'sm':
-        _awaiting_size[str(chat_id)] = market_id
-        _ack(cq_id)
-        _send(chat_id, '📉 Reply with the size in USD (e.g. <code>25</code>)')
-        log.info('Awaiting smaller size: %s', market_id[:14])
+    try:
+        from edge.executor import place_order
+        result      = place_order(
+            token_id=clob_ids[0],
+            size_usd=amount,
+            best_ask=best_ask,
+            blended_confidence=confidence,
+        )
+        order_id    = result['order_id']
+        limit_price = result['limit_price']
+
+        _log_trade(market_id, amount, chat_id,
+                   status='approved', order_id=order_id, limit_price=limit_price)
+        db.execute("""
+            UPDATE mention_opportunities
+            SET status = 'approved', queue_status = NULL
+            WHERE market_id = %s
+        """, (market_id,))
+        _send(chat_id,
+              f'✅ Trade Placed — 🟢 YES · "{q}"\n\n'
+              f'💵 Amount: ${amount:.0f}\n'
+              f'📈 To return: ${payout:.2f}\n'
+              f'⏱ Resolves: {resolve_str}')
+        log.info('Order placed: %s  $%.0f @ %.3f', market_id[:14], amount, limit_price)
+
+    except Exception as e:
+        log.error('Execution error for %s: %s', market_id[:14], e)
+        _log_trade(market_id, amount, chat_id, status='approved_dry_run')
+        _send(chat_id, f'⚠️ Execution failed — dry-run logged\n{str(e)[:200]}')
+
+    advance_queue()
 
 
-# ── Message handler (size replies + /pause /resume) ───────────────────────────
+def _handle_n(opp: dict, chat_id: str) -> None:
+    market_id = opp['market_id']
+    q         = (opp.get('question') or market_id)[:80]
+    skip_opp(market_id)
+    _send(chat_id, f'❌ Trade Skipped — "{q}"')
+    log.info('Skipped: %s', market_id[:14])
+    advance_queue()
+
+
+def _handle_w(opp: dict, chat_id: str) -> None:
+    sig = db.fetchone("""
+        SELECT llm_reasoning FROM mention_signals
+        WHERE market_id = %s
+        ORDER BY scored_at DESC
+        LIMIT 1
+    """, (opp['market_id'],))
+    reasoning = (sig or {}).get('llm_reasoning') or 'No reasoning available.'
+    _send(chat_id, f'🧠 Reasoning\n\n{reasoning}')
+
+
+def _handle_d(opp: dict, chat_id: str) -> None:
+    criteria = (opp.get('resolution_criteria_summary') or '').strip()
+    desc     = (opp.get('description') or '').strip()
+    body     = criteria or desc or 'No description available.'
+    _send(chat_id, f'📄 Description\n\n{body}')
+
+
+def _handle_command(cmd: str, chat_id: str) -> None:
+    if cmd == '/pause':
+        trading_state.pause()
+        _send(chat_id, '⏸ Trading paused. Use /resume to re-enable.')
+    elif cmd == '/resume':
+        trading_state.resume()
+        _send(chat_id, '▶️ Trading resumed.')
+    elif cmd == '/status':
+        state = '⏸ PAUSED' if trading_state.is_paused() else '▶️ LIVE'
+        opp   = get_open_opportunity()
+        q     = f'\n\nOpen trade: "{(opp.get("question") or "")[:60]}"' if opp else ''
+        _send(chat_id, f'Trading state: {state}{q}')
+    elif cmd == '/calibration':
+        from calibration.report import get_chunks
+        for chunk in get_chunks():
+            _send(chat_id, chunk)
+
+
+# ── Message dispatcher ────────────────────────────────────────────────────────
 
 def _handle_message(update: dict) -> None:
     msg     = update.get('message', {})
     chat_id = str(msg.get('chat', {}).get('id', ''))
     text    = (msg.get('text') or '').strip()
 
-    cmd = text.lower().split()[0] if text else ''
-
-    if cmd == '/pause':
-        trading_state.pause()
-        _send(chat_id,
-              '⏸ <b>Trading paused</b>\n'
-              'Alerts and scanning continue. [Approve] falls back to dry-run.\n'
-              'Use /resume to re-enable.')
+    if not text:
         return
 
-    if cmd == '/resume':
-        trading_state.resume()
-        _send(chat_id, '▶️ <b>Trading resumed</b> — [Approve] will place real orders.')
+    if text.startswith('/'):
+        _handle_command(text.lower().split()[0], chat_id)
         return
 
-    if cmd == '/status':
-        state = '⏸ PAUSED' if trading_state.is_paused() else '▶️ LIVE'
-        _send(chat_id, f'Trading state: <b>{state}</b>')
+    opp = get_open_opportunity()
+    if opp is None:
+        _send(chat_id, 'No open trade right now.')
         return
 
-    if cmd == '/calibration':
-        from calibration.report import get_chunks
-        for chunk in get_chunks():
-            _send(chat_id, chunk)
-        return
+    token = text.lower().split()[0]
 
-    # Size reply for approve_smaller
-    if chat_id not in _awaiting_size:
-        return
+    if token == 'y':
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                amount = float(parts[1].replace('$', '').replace(',', ''))
+                if amount <= 0:
+                    raise ValueError
+                _handle_y(opp, amount, chat_id)
+                return
+            except ValueError:
+                pass
+        _send(chat_id, "didn't catch that — reply y [amount], n, w, or d")
 
-    market_id = _awaiting_size.pop(chat_id)
+    elif token == 'n':
+        _handle_n(opp, chat_id)
 
-    try:
-        size = float(text.replace('$', '').replace(',', ''))
-        if size <= 0:
-            raise ValueError('non-positive')
-    except ValueError:
-        _send(chat_id, '❌ Invalid — send a number like <code>25</code>')
-        _awaiting_size[chat_id] = market_id
-        return
+    elif token == 'w':
+        _handle_w(opp, chat_id)
 
-    if trading_state.is_paused():
-        _log_trade(market_id, size, chat_id, status='approved_dry_run')
-        _send(chat_id,
-              f'✅ <b>DRY RUN (paused)</b>\n'
-              f'Size: <b>${size:.0f}</b> on <code>{market_id[:16]}</code>\n'
-              f'<i>Use /resume to enable live trading</i>')
-        log.info('Approved smaller dry-run (paused): %s  $%.0f', market_id[:14], size)
-        return
+    elif token == 'd':
+        _handle_d(opp, chat_id)
 
-    try:
-        opp = db.fetchone("""
-            SELECT mo.best_ask, mo.blended_confidence, mm.clob_token_ids
-            FROM mention_opportunities mo
-            JOIN mention_markets mm ON mm.market_id = mo.market_id
-            WHERE mo.market_id = %s
-        """, (market_id,)) or {}
-
-        clob_ids = opp.get('clob_token_ids') or []
-
-        from edge.executor import place_order
-        result = place_order(
-            token_id=clob_ids[0],
-            size_usd=size,
-            best_ask=float(opp.get('best_ask') or 0),
-            blended_confidence=float(opp.get('blended_confidence') or 0),
-        )
-        _log_trade(market_id, size, chat_id,
-                   status='approved', order_id=result['order_id'],
-                   limit_price=result['limit_price'])
-        _send(chat_id,
-              f'✅ <b>Order placed (smaller)</b>\n'
-              f'Size: <b>${size:.0f}</b>  •  Limit: {result["limit_price"]:.3f}\n'
-              f'Order: <code>{result["order_id"][:20]}</code>')
-        log.info('Approved smaller: %s  $%.0f', market_id[:14], size)
-
-    except Exception as e:
-        log.error('Smaller execution error: %s', e)
-        _log_trade(market_id, size, chat_id, status='approved_dry_run')
-        _send(chat_id,
-              f'⚠️ <b>Execution failed — dry-run logged</b>\n<code>{str(e)[:200]}</code>')
+    else:
+        _send(chat_id, "didn't catch that — reply y [amount], n, w, or d")
 
 
 # ── APScheduler job ───────────────────────────────────────────────────────────
@@ -297,12 +246,7 @@ def run_callback_poll() -> None:
     for update in updates:
         _state['last_update_id'] = max(_state['last_update_id'], update['update_id'])
         try:
-            if 'callback_query' in update:
-                _handle_callback(update)
-            elif 'message' in update:
-                msg_text = (update['message'].get('text') or '').strip()
-                chat_id  = str(update['message'].get('chat', {}).get('id', ''))
-                if msg_text.startswith('/') or chat_id in _awaiting_size:
-                    _handle_message(update)
+            if 'message' in update:
+                _handle_message(update)
         except Exception as e:
             log.error('Error processing update %s: %s', update.get('update_id'), e)
