@@ -11,6 +11,7 @@ Order type: GTC limit (not FAK market) — we want the order to sit at our price
 cross the spread and eat the edge. The fill monitor polls for fill status.
 """
 
+import json
 import logging
 
 from config import (
@@ -89,14 +90,26 @@ def place_order(
     )
 
     clob = _get_clob()
+
+    # Diagnostic: log the values the CLOB API returns for this token before signing
+    try:
+        tick_size = clob.get_tick_size(token_id)
+        neg_risk  = clob.get_neg_risk(token_id)
+        fee_bps   = clob.get_fee_rate_bps(token_id)
+        log.info('CLOB meta: token=…%s  tick=%s  neg_risk=%s  fee_bps=%s',
+                 token_id[-8:], tick_size, neg_risk, fee_bps)
+    except Exception as e:
+        log.warning('CLOB meta lookup failed: %s', e)
+
     order_args = OrderArgs(
         token_id=token_id,
         price=limit_px,
         size=shares,
         side='BUY',
     )
-    signed   = clob.create_order(order_args)
-    resp     = clob.post_order(signed, OrderType.GTC)
+    signed = clob.create_order(order_args)
+    log.info('signed order: %s', json.dumps(signed.dict(), separators=(',', ':')))
+    resp = clob.post_order(signed, OrderType.GTC)
 
     log.debug('CLOB raw response: %s', resp)
 
