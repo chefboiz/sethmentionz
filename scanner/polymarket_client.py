@@ -64,36 +64,49 @@ def _normalize(m: dict) -> dict:
     }
 
 
-_MAX_PAGES = 20   # safety cap — an 18h window should never need anywhere near this
+_MAX_PAGES = 20   # hard backstop — should never be reached in normal operation
+
+
+def _parse_end_date(end_date_str: str | None) -> datetime | None:
+    if not end_date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, AttributeError):
+        return None
 
 
 def fetch_active_markets(window_hours: int = RESOLUTION_WINDOW_HOURS) -> list[dict]:
     """
-    Fetch Polymarket markets whose end date falls within [now, now + window_hours].
+    Fetch Polymarket markets sorted ascending by endDateIso, stopping as soon as
+    the page's last market falls past now + window_hours.
 
-    Stops when a page returns fewer than _PAGE_CAP results, after _MAX_PAGES pages,
-    or when any page fetch returns an error (processes whatever was already fetched).
+    end_date_min/end_date_max are NOT sent — the API ignores them as a filter
+    (confirmed: 20 pages all came back full regardless). The ascending sort IS
+    honoured, so we can stop early once we've passed the window ceiling.
+    Client-side _within_window in scanner/__init__.py is the authoritative filter.
     """
-    now     = datetime.now(timezone.utc)
-    end_min = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    end_max = (now + timedelta(hours=window_hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now       = datetime.now(timezone.utc)
+    window_end = now + timedelta(hours=window_hours)
 
     base_params = {
-        'closed':        'false',
-        'active':        'true',
-        'end_date_min':  end_min,
-        'end_date_max':  end_max,
-        'limit':         _PAGE_CAP,
-        'order':         'endDateIso',
-        'ascending':     'true',
+        'closed':    'false',
+        'active':    'true',
+        'limit':     _PAGE_CAP,
+        'order':     'endDateIso',
+        'ascending': 'true',
     }
 
-    log.info('Gamma API query: end_date in [%s, %s]  window=%dh  max_pages=%d',
-             end_min, end_max, window_hours, _MAX_PAGES)
+    log.info('Gamma API query: active+closed=false ascending endDateIso  window_end=%s  max_pages=%d',
+             window_end.strftime('%Y-%m-%dT%H:%M:%SZ'), _MAX_PAGES)
 
     markets: list[dict] = []
-    offset   = 0
-    page_num = 0
+    offset      = 0
+    page_num    = 0
+    first_logged = False
 
     with httpx.Client(timeout=15, headers=_HEADERS) as client:
         while page_num < _MAX_PAGES:
@@ -102,25 +115,50 @@ def fetch_active_markets(window_hours: int = RESOLUTION_WINDOW_HOURS) -> list[di
 
             page, stop = _fetch_page(client, f'{POLYMARKET_API_URL}/markets', params, page_num)
 
-            log.info('  page %d (offset=%d): %d raw markets', page_num, offset, len(page))
+            if not page:
+                if not stop:
+                    log.info('  page %d (offset=%d): empty — done', page_num, offset)
+                break
+
+            first_end = page[0].get('endDateIso') or page[0].get('end_date_iso', '')
+            last_end  = page[-1].get('endDateIso') or page[-1].get('end_date_iso', '')
+            log.info('  page %d (offset=%d): %d markets  end_date [%s … %s]',
+                     page_num, offset, len(page),
+                     first_end[:16], last_end[:16])
+
+            # Log the very first market's end_date once per scan
+            if not first_logged and page:
+                first_logged = True
+                log.info('  → nearest market end_date: %s', first_end)
 
             for m in page:
                 normalized = _normalize(m)
                 if normalized:
                     markets.append(normalized)
 
-            if stop or len(page) < _PAGE_CAP:
+            if stop:
+                break
+
+            # Early-exit: results are sorted ascending — if the last item on this page
+            # is already past the window ceiling, nothing further can be in-window.
+            last_dt = _parse_end_date(last_end)
+            if last_dt and last_dt > window_end:
+                log.info('  page %d last market (%s) past window_end — stopping early',
+                         page_num, last_end[:16])
+                break
+
+            if len(page) < _PAGE_CAP:
                 break
 
             offset += _PAGE_CAP
             time.sleep(0.25)
 
         else:
-            log.warning('Gamma API: hit %d-page safety cap at offset=%d — stopping',
-                        _MAX_PAGES, offset)
+            log.warning('Gamma API: hit %d-page safety cap — something may be wrong',
+                        _MAX_PAGES)
 
-    log.info('Gamma API: %d markets collected across %d page(s)  [end_date %s → %s]',
-             len(markets), page_num, end_min, end_max)
+    log.info('Gamma API: %d raw markets across %d page(s) — client-side window filter next',
+             len(markets), page_num)
     return markets
 
 
