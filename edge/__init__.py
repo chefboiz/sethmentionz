@@ -41,12 +41,17 @@ def run_edge() -> None:
 
         book = fetch_book(clob_ids[0])
         if not book:
-            log.warning('No CLOB book for %s', mid[:14])
+            log.info('  SKIP  %-16s  conf=%.3f  no_book', mid[:16], blended)
             continue
 
-        result = compute(book, blended)
+        result, reason = compute(book, blended)
+
+        asks = book.get('asks', [])
+        best_ask = asks[0]['price'] if asks else 0.0
 
         if result is None:
+            log.info('  SKIP  %-16s  conf=%.3f  ask=%.3f  reason: %s',
+                     mid[:16], blended, best_ask, reason)
             db.execute("""
                 UPDATE mention_opportunities
                 SET status = 'expired', last_price_check_at = %s
@@ -88,10 +93,10 @@ def run_edge() -> None:
         })
 
         qualified += 1
-        thin = '  [THIN]' if result['liquidity_flag'] else ''
-        log.info('  QUALIFIED: conf=%.3f  edge=+%.1f%%  size=$%.0f  ask=%.3f%s  — %s',
-                 blended, result['edge_pct'] * 100, result['max_size_usd'],
-                 result['best_ask'], thin, market['question'][:70])
+        thin = '  THIN' if result['liquidity_flag'] else ''
+        log.info('  QUAL  %-16s  conf=%.3f  ask=%.3f  edge=+%.1f%%  size=$%.0f%s',
+                 mid[:16], blended, result['best_ask'],
+                 result['edge_pct'] * 100, result['max_size_usd'], thin)
 
     log.info('=== Edge complete | checked: %d  qualified: %d ===', checked, qualified)
     _print_summary()
@@ -124,7 +129,7 @@ def run_price_refresh() -> None:
         if not book:
             continue
 
-        result = compute(book, blended)
+        result, reason = compute(book, blended)
 
         if result is None:
             db.execute("""
@@ -133,7 +138,7 @@ def run_price_refresh() -> None:
                 WHERE market_id = %s
             """, (now_iso, mid))
             expired += 1
-            log.info('Price refresh: %s expired — edge closed', mid[:14])
+            log.info('Price refresh: %s expired  reason: %s', mid[:14], reason)
         else:
             db.execute("""
                 UPDATE mention_opportunities SET
