@@ -7,9 +7,14 @@ from config import (
 )
 
 
-def compute(book: dict, blended_confidence: float) -> tuple[dict | None, str]:
+def compute(book: dict, blended_confidence: float,
+            best_ask: float) -> tuple[dict | None, str]:
     """
-    Compute YES-side edge metrics by walking the ask ladder.
+    Compute YES-side edge metrics.
+
+    best_ask must come from GET /price (not /book — /book returns stale ghost-market
+    placeholder prices for many active markets; see Polymarket API issue #180).
+    book is used only for depth/liquidity walk.
 
     Returns (result_dict, reason).  result_dict is None when any gate fails;
     reason is always set so callers can log exactly which gate fired.
@@ -17,15 +22,9 @@ def compute(book: dict, blended_confidence: float) -> tuple[dict | None, str]:
     Qualification gates (applied in order):
       1. blended_confidence >= CONFIDENCE_THRESHOLD
       2. best_ask < EDGE_MAX_PRICE  (96c ceiling)
-      3. top-of-book edge_pct >= EDGE_MIN_PCT
+      3. edge_pct >= EDGE_MIN_PCT
       4. max_size_at_edge >= MIN_VIABLE_SIZE_USD
     """
-    asks = book.get('asks', [])
-    if not asks:
-        return None, 'no_asks'
-
-    best_ask = asks[0]['price']
-
     if blended_confidence < CONFIDENCE_THRESHOLD:
         return None, f'conf {blended_confidence:.3f} < threshold {CONFIDENCE_THRESHOLD:.3f}'
 
@@ -36,11 +35,13 @@ def compute(book: dict, blended_confidence: float) -> tuple[dict | None, str]:
     if edge_pct < EDGE_MIN_PCT:
         return None, f'edge {edge_pct:+.3f} < floor {EDGE_MIN_PCT:.2f}  (conf={blended_confidence:.3f} ask={best_ask:.3f})'
 
+    # Walk the book ladder for depth — uses /book data (depth is not affected by the
+    # ghost-price bug; only the top-of-book price field is stale)
     max_fill_price  = blended_confidence - EDGE_MIN_PCT
     max_size_usd    = 0.0
     total_depth_usd = 0.0
 
-    for lvl in asks:
+    for lvl in book.get('asks', []):
         p, s = lvl['price'], lvl['size']
         cost = p * s
         total_depth_usd += cost

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import db
 from config import CONFIDENCE_THRESHOLD
-from edge.clob_client import fetch_book
+from edge.clob_client import fetch_book, fetch_price
 from edge.calculator import compute
 
 log = logging.getLogger(__name__)
@@ -15,6 +15,7 @@ def run_edge() -> None:
 
     markets = db.fetchall("""
         SELECT mm.market_id, mm.question, mm.clob_token_ids,
+               mm.yes_price AS gamma_yes_price,
                ms.blended_score
         FROM mention_markets mm
         JOIN LATERAL (
@@ -36,18 +37,27 @@ def run_edge() -> None:
         if not clob_ids:
             continue
 
-        blended = float(market['blended_score'])
+        blended     = float(market['blended_score'])
+        gamma_price = float(market['gamma_yes_price'] or 0)
         checked += 1
+
+        # /price gives the accurate real-time BUY price; /book top-of-book is stale
+        best_ask = fetch_price(clob_ids[0], side='BUY')
+        if best_ask is None:
+            log.info('  SKIP  %-16s  conf=%.3f  no_price', mid[:16], blended)
+            continue
+
+        # Sanity check: warn if CLOB price and Gamma price diverge by >15 cents
+        if gamma_price > 0 and abs(best_ask - gamma_price) > 0.15:
+            log.warning('  PRICE MISMATCH  %-16s  clob=%.3f  gamma=%.3f  diff=%.3f',
+                        mid[:16], best_ask, gamma_price, best_ask - gamma_price)
 
         book = fetch_book(clob_ids[0])
         if not book:
-            log.info('  SKIP  %-16s  conf=%.3f  no_book', mid[:16], blended)
+            log.info('  SKIP  %-16s  conf=%.3f  ask=%.3f  no_book_depth', mid[:16], blended, best_ask)
             continue
 
-        result, reason = compute(book, blended)
-
-        asks = book.get('asks', [])
-        best_ask = asks[0]['price'] if asks else 0.0
+        result, reason = compute(book, blended, best_ask)
 
         if result is None:
             log.info('  SKIP  %-16s  conf=%.3f  ask=%.3f  reason: %s',
@@ -125,11 +135,15 @@ def run_price_refresh() -> None:
         if not clob_ids:
             continue
 
+        best_ask = fetch_price(clob_ids[0], side='BUY')
+        if best_ask is None:
+            continue
+
         book = fetch_book(clob_ids[0])
         if not book:
             continue
 
-        result, reason = compute(book, blended)
+        result, reason = compute(book, blended, best_ask)
 
         if result is None:
             db.execute("""
