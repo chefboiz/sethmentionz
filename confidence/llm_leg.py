@@ -2,6 +2,7 @@ import json
 import logging
 import anthropic
 from config import ANTHROPIC_API_KEY
+from utils.llm_json import parse_llm_json
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +65,7 @@ def score(market: dict) -> dict:
                 max_tokens=400,
                 messages=[{'role': 'user', 'content': prompt}],
             )
-            text = msg.content[0].text.strip()
-            parsed = json.loads(text)
+            parsed = parse_llm_json(msg.content[0].text, 'llm_leg')
 
             prob = float(parsed['probability'])
             if not 0.0 <= prob <= 1.0:

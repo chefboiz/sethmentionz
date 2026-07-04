@@ -2,6 +2,7 @@ import json
 import logging
 import anthropic
 from config import ANTHROPIC_API_KEY
+from utils.llm_json import parse_llm_json
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def extract_fields(market: dict) -> dict:
                 max_tokens=200,
                 messages=[{'role': 'user', 'content': prompt}],
             )
-            parsed = json.loads(msg.content[0].text.strip())
+            parsed = parse_llm_json(msg.content[0].text, 'extractor')
             return {
                 'subject':                    parsed.get('subject', ''),
                 'phrase_topic':               parsed.get('phrase_topic', ''),
@@ -61,8 +62,6 @@ def extract_fields(market: dict) -> dict:
             }
         except json.JSONDecodeError:
             if attempt == 0:
-                log.debug('Extractor: malformed JSON, retrying for "%s"',
-                          market.get('question', '')[:60])
                 continue
             log.warning('Extractor: gave up on "%s"', market.get('question', '')[:70])
         except Exception as e:

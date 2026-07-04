@@ -1,8 +1,8 @@
 import json
 import logging
-import re
 import anthropic
 from config import ANTHROPIC_API_KEY
+from utils.llm_json import parse_llm_json
 
 log = logging.getLogger(__name__)
 
@@ -48,28 +48,6 @@ def _regex_pass(question: str) -> bool:
     return any(p.search(question) for p in _PATTERNS)
 
 
-def _extract_json(text: str) -> dict:
-    """
-    Parse JSON from a model response that may be wrapped in markdown code fences
-    or have stray preamble/postamble text around the actual JSON object.
-    Raises json.JSONDecodeError if nothing parses.
-    """
-    # 1. Strip markdown code fences (```json ... ```, ``` ... ```)
-    stripped = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.I)
-    stripped = re.sub(r'\s*```$', '', stripped.strip())
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    # 2. Find the first {...} block in the text
-    m = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-    if m:
-        return json.loads(m.group())
-
-    raise json.JSONDecodeError('no JSON object found', text, 0)
-
-
 def _llm_pass(question: str, description: str) -> bool:
     prompt = _CLASSIFY_PROMPT.format(
         question=question,
@@ -82,11 +60,8 @@ def _llm_pass(question: str, description: str) -> bool:
                 max_tokens=100,
                 messages=[{'role': 'user', 'content': prompt}],
             )
-            text = msg.content[0].text.strip()
-            return bool(_extract_json(text).get('is_mention_market'))
+            return bool(parse_llm_json(msg.content[0].text, 'mention_filter').get('is_mention_market'))
         except json.JSONDecodeError:
-            log.debug('LLM classification: malformed JSON (attempt %d), raw: %r',
-                      attempt + 1, msg.content[0].text[:300] if 'msg' in dir() else '(no response)')
             if attempt == 0:
                 continue
             log.warning('LLM classification: gave up on "%s"', question[:70])
