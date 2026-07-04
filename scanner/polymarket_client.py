@@ -55,7 +55,7 @@ def _normalize(m: dict) -> dict:
         'resolution_source': m.get('resolutionSource', ''),
         'yes_price':         _price(yes_idx, 0),
         'no_price':          _price(no_idx,  1),
-        'end_date':          m.get('endDateIso') or m.get('end_date_iso'),
+        'end_date':          m.get('endDate') or m.get('endDateIso') or m.get('end_date_iso'),
         'closed':            m.get('closed', False),
         'clob_token_ids':    clob_ids,
         'volume':            _to_float(m.get('volume')),
