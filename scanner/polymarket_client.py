@@ -1,12 +1,16 @@
 import json
 import logging
 import time
+from datetime import datetime, timezone, timedelta
+
 import httpx
-from config import POLYMARKET_API_URL
+
+from config import POLYMARKET_API_URL, RESOLUTION_WINDOW_HOURS
 
 log = logging.getLogger(__name__)
 
-_HEADERS = {'Content-Type': 'application/json'}
+_HEADERS  = {'Content-Type': 'application/json'}
+_PAGE_CAP = 100   # Gamma API ignores limit values above 100
 
 
 def _parse_json_field(val) -> list:
@@ -19,9 +23,9 @@ def _parse_json_field(val) -> list:
 
 
 def _normalize(m: dict) -> dict:
-    outcomes  = _parse_json_field(m.get('outcomes'))
-    prices    = _parse_json_field(m.get('outcomePrices'))
-    clob_ids  = _parse_json_field(m.get('clobTokenIds'))
+    outcomes = _parse_json_field(m.get('outcomes'))
+    prices   = _parse_json_field(m.get('outcomePrices'))
+    clob_ids = _parse_json_field(m.get('clobTokenIds'))
 
     yes_idx = next((i for i, o in enumerate(outcomes) if str(o).upper() == 'YES'), None)
     no_idx  = next((i for i, o in enumerate(outcomes) if str(o).upper() == 'NO'),  None)
@@ -33,52 +37,76 @@ def _normalize(m: dict) -> dict:
             return float(prices[fallback_idx])
         return None
 
+    market_id = m.get('conditionId') or m.get('id')
+    if not market_id:
+        return None
     return {
-        'id':               m.get('conditionId') or m.get('id'),
-        'slug':             m.get('slug'),
-        'question':         m.get('question', ''),
-        'description':      m.get('description', ''),
+        'id':                market_id,
+        'slug':              m.get('slug'),
+        'question':          m.get('question', ''),
+        'description':       m.get('description', ''),
         'resolution_source': m.get('resolutionSource', ''),
-        'yes_price':        _price(yes_idx, 0),
-        'no_price':         _price(no_idx,  1),
-        'end_date':         m.get('endDateIso') or m.get('end_date_iso'),
-        'closed':           m.get('closed', False),
-        'clob_token_ids':   clob_ids,
-        'volume':           m.get('volume'),
-        'liquidity':        m.get('liquidity'),
+        'yes_price':         _price(yes_idx, 0),
+        'no_price':          _price(no_idx,  1),
+        'end_date':          m.get('endDateIso') or m.get('end_date_iso'),
+        'closed':            m.get('closed', False),
+        'clob_token_ids':    clob_ids,
+        'volume':            m.get('volume'),
+        'liquidity':         m.get('liquidity'),
     }
 
 
-def fetch_active_markets(page_size: int = 200, max_pages: int = 25) -> list[dict]:
-    """Paginate through all open Polymarket markets, ordered by soonest end date first."""
+def fetch_active_markets(window_hours: int = RESOLUTION_WINDOW_HOURS) -> list[dict]:
+    """
+    Fetch Polymarket markets whose end date falls within [now, now + window_hours].
+
+    Uses server-side date-range filtering to avoid the stale-oracle-resolution problem
+    (old unresolved markets sorting to the front of an ascending endDateIso page).
+    Falls back to a client-side _within_window check as a defensive double-check.
+    """
+    now     = datetime.now(timezone.utc)
+    end_min = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_max = (now + timedelta(hours=window_hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    base_params = {
+        'closed':        'false',
+        'active':        'true',
+        'end_date_min':  end_min,
+        'end_date_max':  end_max,
+        'limit':         _PAGE_CAP,
+        'order':         'endDateIso',
+        'ascending':     'true',
+    }
+
+    log.info('Gamma API query: end_date in [%s, %s]  window=%dh',
+             end_min, end_max, window_hours)
+
     markets: list[dict] = []
-    offset = 0
+    offset   = 0
+    page_num = 0
 
     with httpx.Client(timeout=15, headers=_HEADERS) as client:
-        for _ in range(max_pages):
-            params = {
-                'closed':    'false',
-                'limit':     page_size,
-                'offset':    offset,
-                'order':     'endDateIso',
-                'ascending': 'true',
-            }
-            raw = _get_with_backoff(client, f'{POLYMARKET_API_URL}/markets', params)
-            page = raw if isinstance(raw, list) else raw.get('markets', [])
+        while True:
+            page_num += 1
+            params = {**base_params, 'offset': offset}
+            raw    = _get_with_backoff(client, f'{POLYMARKET_API_URL}/markets', params)
+            page   = raw if isinstance(raw, list) else raw.get('markets', [])
 
-            if not page:
-                break
+            log.info('  page %d (offset=%d): %d raw markets', page_num, offset, len(page))
 
-            markets.extend(_normalize(m) for m in page)
+            for m in page:
+                normalized = _normalize(m)
+                if normalized:
+                    markets.append(normalized)
 
-            if len(page) < page_size:
-                break
+            if len(page) < _PAGE_CAP:
+                break   # last page
 
-            offset += page_size
+            offset += _PAGE_CAP
             time.sleep(0.25)
 
-    log.info('Gamma API: fetched %d open markets across %d pages',
-             len(markets), max(1, offset // page_size + 1))
+    log.info('Gamma API: fetched %d markets in window across %d page(s)',
+             len(markets), page_num)
     return markets
 
 
