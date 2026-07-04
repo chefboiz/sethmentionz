@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import anthropic
 from config import ANTHROPIC_API_KEY
 from utils.llm_json import parse_llm_json
