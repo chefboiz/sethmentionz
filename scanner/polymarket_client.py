@@ -64,13 +64,15 @@ def _normalize(m: dict) -> dict:
     }
 
 
+_MAX_PAGES = 20   # safety cap — an 18h window should never need anywhere near this
+
+
 def fetch_active_markets(window_hours: int = RESOLUTION_WINDOW_HOURS) -> list[dict]:
     """
     Fetch Polymarket markets whose end date falls within [now, now + window_hours].
 
-    Uses server-side date-range filtering to avoid the stale-oracle-resolution problem
-    (old unresolved markets sorting to the front of an ascending endDateIso page).
-    Falls back to a client-side _within_window check as a defensive double-check.
+    Stops when a page returns fewer than _PAGE_CAP results, after _MAX_PAGES pages,
+    or when any page fetch returns an error (processes whatever was already fetched).
     """
     now     = datetime.now(timezone.utc)
     end_min = now.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -86,19 +88,19 @@ def fetch_active_markets(window_hours: int = RESOLUTION_WINDOW_HOURS) -> list[di
         'ascending':     'true',
     }
 
-    log.info('Gamma API query: end_date in [%s, %s]  window=%dh',
-             end_min, end_max, window_hours)
+    log.info('Gamma API query: end_date in [%s, %s]  window=%dh  max_pages=%d',
+             end_min, end_max, window_hours, _MAX_PAGES)
 
     markets: list[dict] = []
     offset   = 0
     page_num = 0
 
     with httpx.Client(timeout=15, headers=_HEADERS) as client:
-        while True:
+        while page_num < _MAX_PAGES:
             page_num += 1
             params = {**base_params, 'offset': offset}
-            raw    = _get_with_backoff(client, f'{POLYMARKET_API_URL}/markets', params)
-            page   = raw if isinstance(raw, list) else raw.get('markets', [])
+
+            page, stop = _fetch_page(client, f'{POLYMARKET_API_URL}/markets', params, page_num)
 
             log.info('  page %d (offset=%d): %d raw markets', page_num, offset, len(page))
 
@@ -107,31 +109,56 @@ def fetch_active_markets(window_hours: int = RESOLUTION_WINDOW_HOURS) -> list[di
                 if normalized:
                     markets.append(normalized)
 
-            if len(page) < _PAGE_CAP:
-                break   # last page
+            if stop or len(page) < _PAGE_CAP:
+                break
 
             offset += _PAGE_CAP
             time.sleep(0.25)
 
-    log.info('Gamma API: fetched %d markets in window across %d page(s)',
-             len(markets), page_num)
+        else:
+            log.warning('Gamma API: hit %d-page safety cap at offset=%d — stopping',
+                        _MAX_PAGES, offset)
+
+    log.info('Gamma API: %d markets collected across %d page(s)  [end_date %s → %s]',
+             len(markets), page_num, end_min, end_max)
     return markets
 
 
-def _get_with_backoff(client: httpx.Client, url: str, params: dict) -> dict | list:
+def _fetch_page(client: httpx.Client, url: str, params: dict,
+                page_num: int) -> tuple[list, bool]:
+    """
+    Fetch one page. Returns (page_list, stop).
+    stop=True means the caller should not request the next page
+    (either an error occurred or the API returned nothing useful).
+    """
     for attempt in range(3):
         try:
             r = client.get(url, params=params)
+
             if r.status_code == 429:
                 wait = 2 ** (attempt + 1)
-                log.warning('Rate limited — retrying in %ds', wait)
+                log.warning('Rate limited on page %d — retrying in %ds', page_num, wait)
                 time.sleep(wait)
                 continue
+
+            if r.status_code >= 400:
+                log.warning(
+                    'Gamma API %s on page %d (offset=%s) — stopping pagination. '
+                    'Processed pages before this are still usable.',
+                    r.status_code, page_num, params.get('offset', 0),
+                )
+                return [], True
+
             r.raise_for_status()
-            return r.json()
+            raw  = r.json()
+            page = raw if isinstance(raw, list) else raw.get('markets', [])
+            return page, False
+
         except httpx.RequestError as e:
             if attempt == 2:
-                raise
-            log.warning('Request error (%s), retrying', e)
+                log.warning('Request error on page %d: %s — stopping pagination', page_num, e)
+                return [], True
+            log.warning('Request error on page %d (%s), retrying', page_num, e)
             time.sleep(2 ** attempt)
-    return []
+
+    return [], True
