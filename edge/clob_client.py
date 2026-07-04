@@ -17,7 +17,7 @@ def fetch_book(token_id: str) -> dict | None:
     for attempt in range(3):
         try:
             with httpx.Client(timeout=8) as client:
-                r = client.get(f'{CLOB_BASE}/orderbook/', params={'token_id': token_id})
+                r = client.get(f'{CLOB_BASE}/book', params={'token_id': token_id})
                 if r.status_code == 429:
                     time.sleep(2 ** (attempt + 1))
                     continue
