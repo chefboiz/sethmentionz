@@ -40,6 +40,13 @@ def _normalize(m: dict) -> dict:
     market_id = m.get('conditionId') or m.get('id')
     if not market_id:
         return None
+
+    def _to_float(val):
+        try:
+            return float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
     return {
         'id':                market_id,
         'slug':              m.get('slug'),
@@ -51,8 +58,9 @@ def _normalize(m: dict) -> dict:
         'end_date':          m.get('endDateIso') or m.get('end_date_iso'),
         'closed':            m.get('closed', False),
         'clob_token_ids':    clob_ids,
-        'volume':            m.get('volume'),
-        'liquidity':         m.get('liquidity'),
+        'volume':            _to_float(m.get('volume')),
+        'volume24hr':        _to_float(m.get('volume24hr') or m.get('volume_24hr')),
+        'liquidity':         _to_float(m.get('liquidity') or m.get('liquidityClob')),
     }
 
 

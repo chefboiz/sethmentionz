@@ -50,12 +50,13 @@ def run_scan() -> None:
             INSERT INTO mention_markets (
                 market_id, slug, question, description, resolution_source,
                 subject, phrase_topic, context, resolution_criteria_summary,
-                resolution_deadline, yes_price, no_price, clob_token_ids, last_updated
+                resolution_deadline, yes_price, no_price, clob_token_ids,
+                volume24hr, liquidity, last_updated
             ) VALUES (
                 %(market_id)s, %(slug)s, %(question)s, %(description)s, %(resolution_source)s,
                 %(subject)s, %(phrase_topic)s, %(context)s, %(resolution_criteria_summary)s,
                 %(resolution_deadline)s, %(yes_price)s, %(no_price)s, %(clob_token_ids)s,
-                %(last_updated)s
+                %(volume24hr)s, %(liquidity)s, %(last_updated)s
             )
             ON CONFLICT (market_id) DO UPDATE SET
                 slug                        = EXCLUDED.slug,
@@ -70,6 +71,8 @@ def run_scan() -> None:
                 yes_price                   = EXCLUDED.yes_price,
                 no_price                    = EXCLUDED.no_price,
                 clob_token_ids              = EXCLUDED.clob_token_ids,
+                volume24hr                  = EXCLUDED.volume24hr,
+                liquidity                   = EXCLUDED.liquidity,
                 last_updated                = EXCLUDED.last_updated
         """, {
             'market_id':                    market['id'],
@@ -85,6 +88,8 @@ def run_scan() -> None:
             'yes_price':                    market.get('yes_price'),
             'no_price':                     market.get('no_price'),
             'clob_token_ids':               Json(market.get('clob_token_ids', [])),
+            'volume24hr':                   market.get('volume24hr'),
+            'liquidity':                    market.get('liquidity'),
             'last_updated':                 now_iso,
         })
 

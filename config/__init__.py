@@ -39,3 +39,12 @@ SLIPPAGE_TOLERANCE       = float(os.getenv('SLIPPAGE_TOLERANCE', '0.01'))
 FILL_TIMEOUT_MINUTES     = int(os.getenv('FILL_TIMEOUT_MINUTES', '10'))
 FILL_MONITOR_SECONDS          = int(os.getenv('FILL_MONITOR_SECONDS', '30'))
 RESOLUTION_CHECK_MINUTES      = int(os.getenv('RESOLUTION_CHECK_MINUTES', '15'))
+
+# Phase 7 — Longshot momentum scanner
+LONGSHOT_MIN_DEPTH_USD         = float(os.getenv('LONGSHOT_MIN_DEPTH_USD', '100'))
+LONGSHOT_MAX_PRICE             = float(os.getenv('LONGSHOT_MAX_PRICE', '0.25'))
+LONGSHOT_SCORE_INTERVAL_MINUTES = int(os.getenv('LONGSHOT_SCORE_INTERVAL_MINUTES', '15'))
+LONGSHOT_DIGEST_INTERVAL_MINUTES = int(os.getenv('LONGSHOT_DIGEST_INTERVAL_MINUTES', '15'))
+MOMENTUM_WEIGHT               = float(os.getenv('MOMENTUM_WEIGHT', '0.40'))
+VOLUME_WEIGHT                 = float(os.getenv('VOLUME_WEIGHT', '0.35'))
+TIME_WEIGHT                   = float(os.getenv('TIME_WEIGHT', '0.25'))

@@ -15,7 +15,10 @@ from telegram.alerts import (
 
 log = logging.getLogger(__name__)
 
-_state: dict = {'last_update_id': 0}
+_state: dict = {
+    'last_update_id':    0,
+    'longshot_pending':  None,  # set by _handle_b, cleared by y/n
+}
 
 
 # ── Low-level send ────────────────────────────────────────────────────────────
@@ -174,6 +177,151 @@ def _handle_command(cmd: str, chat_id: str) -> None:
             _send(chat_id, chunk)
 
 
+# ── Longshot buy handlers ─────────────────────────────────────────────────────
+
+def _handle_b(text: str, chat_id: str) -> None:
+    """Handle `b {row}{c|e} {amount}` — longshot buy intent, shows confirmation."""
+    from longshot.digest import get_digest_rows
+
+    parts = text.lower().split()
+    if len(parts) < 3:
+        _send(chat_id, 'Format: b {row}{c|e} {amount}  e.g. "b 1c 10"')
+        return
+
+    row_side_str = parts[1]
+    amount_str   = parts[2]
+
+    # Parse row number and side character ('c' = cheap, 'e' = expensive)
+    side_char = ''
+    row_str   = row_side_str
+    if row_side_str and row_side_str[-1] in ('c', 'e'):
+        side_char = row_side_str[-1]
+        row_str   = row_side_str[:-1]
+
+    try:
+        row_num = int(row_str)
+        amount  = float(amount_str.replace('$', '').replace(',', ''))
+        if row_num < 1 or amount <= 0:
+            raise ValueError
+    except ValueError:
+        _send(chat_id, 'Format: b {row}{c|e} {amount}  e.g. "b 1c 10"')
+        return
+
+    digest_rows = get_digest_rows()
+    if not digest_rows:
+        _send(chat_id, 'No current longshot digest — wait for the next scorer run.')
+        return
+    if row_num > len(digest_rows):
+        _send(chat_id, f'Only {len(digest_rows)} rows in the last digest.')
+        return
+
+    row        = digest_rows[row_num - 1]
+    mid        = row['market_id']
+    cheap_side = row.get('cheap_side', 'yes')
+    exp_side   = 'no' if cheap_side == 'yes' else 'yes'
+
+    if side_char == 'e':
+        trade_side  = exp_side
+        trade_price = float(row.get('expensive_price') or 0)
+    else:
+        # 'c' or no side char → cheap side
+        trade_side  = cheap_side
+        trade_price = float(row.get('cheap_price') or 0)
+
+    if trade_price <= 0:
+        _send(chat_id, 'No valid price for that row — try after the next scorer run.')
+        return
+
+    clob_ids  = row.get('clob_token_ids') or []
+    token_idx = 0 if trade_side.lower() == 'yes' else 1
+    clob_token = clob_ids[token_idx] if token_idx < len(clob_ids) else None
+
+    question = (row.get('question') or mid)[:60]
+    payout   = round(amount / trade_price, 2) if trade_price else 0
+
+    _state['longshot_pending'] = {
+        'market_id':  mid,
+        'side':       trade_side.upper(),
+        'price':      trade_price,
+        'amount':     amount,
+        'payout':     payout,
+        'question':   question,
+        'clob_token': clob_token,
+        'composite':  float(row.get('composite_score') or 0),
+    }
+
+    _send(chat_id,
+          f'Confirm: BUY {trade_side.upper()} · "{question}"\n'
+          f'Amount: ${amount:.0f} @ ${trade_price:.2f}\n'
+          f'Est. payout: ${payout:.2f}\n\n'
+          f'Reply y to confirm, n to cancel.')
+
+
+def _handle_longshot_confirm(chat_id: str) -> None:
+    """Execute confirmed longshot trade (after `b` → `y`)."""
+    pending = _state['longshot_pending']
+    _state['longshot_pending'] = None
+
+    mid        = pending['market_id']
+    side       = pending['side']
+    price      = pending['price']
+    amount     = pending['amount']
+    payout     = pending['payout']
+    question   = pending['question']
+    clob_token = pending['clob_token']
+    composite  = pending['composite']
+
+    if trading_state.is_paused() or not clob_token:
+        reason = 'paused' if trading_state.is_paused() else 'no token ID'
+        db.execute("""
+            INSERT INTO mention_trades (
+                market_id, side, size_usd, price, confidence, edge_pct,
+                status, telegram_chat_id, approved_at, strategy
+            ) VALUES (%s, %s, %s, %s, %s, NULL, 'approved_dry_run', %s, NOW(), 'longshot_momentum')
+        """, (mid, side, amount, price, composite, str(chat_id)))
+        _send(chat_id,
+              f'✅ Longshot Logged (dry-run — {reason}) · {side} · "{question}"\n\n'
+              f'💵 Amount: ${amount:.0f}\n'
+              f'📈 To return: ${payout:.2f}')
+        log.info('Longshot dry-run (%s): %s  $%.0f @ %.3f', reason, mid[:14], amount, price)
+        return
+
+    try:
+        from edge.executor import place_order
+        # Pass composite_score as blended_confidence; limit price will be price + slippage
+        # since composite (0–1) >> price ceiling for cheap-side longshots
+        result      = place_order(
+            token_id=clob_token,
+            size_usd=amount,
+            best_ask=price,
+            blended_confidence=max(composite, price + 0.10),
+        )
+        order_id    = result['order_id']
+        limit_price = result['limit_price']
+        db.execute("""
+            INSERT INTO mention_trades (
+                market_id, side, size_usd, price, confidence, edge_pct,
+                status, telegram_chat_id, order_id, limit_price, approved_at, strategy
+            ) VALUES (%s, %s, %s, %s, %s, NULL, 'approved', %s, %s, %s, NOW(), 'longshot_momentum')
+        """, (mid, side, amount, price, composite, str(chat_id), order_id, limit_price))
+        _send(chat_id,
+              f'✅ Longshot Trade Placed · {side} · "{question}"\n\n'
+              f'💵 Amount: ${amount:.0f}\n'
+              f'📈 To return: ${payout:.2f}')
+        log.info('Longshot order: %s  $%.0f @ %.3f  order=%s',
+                 mid[:14], amount, limit_price, order_id[:12])
+
+    except Exception as e:
+        log.error('Longshot execution error for %s: %s', mid[:14], e)
+        db.execute("""
+            INSERT INTO mention_trades (
+                market_id, side, size_usd, price, confidence, edge_pct,
+                status, telegram_chat_id, approved_at, strategy
+            ) VALUES (%s, %s, %s, %s, %s, NULL, 'approved_dry_run', %s, NOW(), 'longshot_momentum')
+        """, (mid, side, amount, price, composite, str(chat_id)))
+        _send(chat_id, f'⚠️ Execution failed — dry-run logged\n{str(e)[:200]}')
+
+
 # ── Message dispatcher ────────────────────────────────────────────────────────
 
 def _handle_message(update: dict) -> None:
@@ -188,12 +336,28 @@ def _handle_message(update: dict) -> None:
         _handle_command(text.lower().split()[0], chat_id)
         return
 
+    token = text.lower().split()[0]
+
+    # Longshot buy intent
+    if token == 'b':
+        _handle_b(text, chat_id)
+        return
+
+    # Longshot confirmation takes priority (y/n confirm the pending b-command)
+    if _state.get('longshot_pending'):
+        if token == 'y':
+            _handle_longshot_confirm(chat_id)
+            return
+        elif token == 'n':
+            _state['longshot_pending'] = None
+            _send(chat_id, '❌ Longshot trade cancelled.')
+            return
+
+    # LLM queue handlers
     opp = get_open_opportunity()
     if opp is None:
         _send(chat_id, 'No open trade right now.')
         return
-
-    token = text.lower().split()[0]
 
     if token == 'y':
         parts = text.split()

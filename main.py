@@ -14,6 +14,8 @@ from config import (
     CALLBACK_POLL_SECONDS,
     FILL_MONITOR_SECONDS,
     RESOLUTION_CHECK_MINUTES,
+    LONGSHOT_SCORE_INTERVAL_MINUTES,
+    LONGSHOT_DIGEST_INTERVAL_MINUTES,
 )
 import db
 import telegram as tg
@@ -26,6 +28,8 @@ from edge.fill_monitor import run_fill_monitor
 from resolution.tracker import run_resolution_check
 from telegram.alerts import run_alert_check
 from telegram.callbacks import run_callback_poll
+from longshot.scorer import run_longshot_score
+from longshot.digest import run_longshot_digest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,6 +91,16 @@ def main() -> None:
                       minutes=RESOLUTION_CHECK_MINUTES, id='resolution',
                       next_run_time=now + timedelta(minutes=6))
 
+    # ── Phase 7 — longshot scorer ────────────────────────────────────────────
+    scheduler.add_job(run_longshot_score, 'interval',
+                      minutes=LONGSHOT_SCORE_INTERVAL_MINUTES, id='longshot_score',
+                      next_run_time=now + timedelta(minutes=7))
+
+    # ── Phase 7 — longshot digest ────────────────────────────────────────────
+    scheduler.add_job(run_longshot_digest, 'interval',
+                      minutes=LONGSHOT_DIGEST_INTERVAL_MINUTES, id='longshot_digest',
+                      next_run_time=now + timedelta(minutes=8))
+
     # ── Phase 6 — error alerting ──────────────────────────────────────────────
     monitoring.register(scheduler)
 
@@ -97,13 +111,17 @@ def main() -> None:
         '  alert_check              every %ds\n'
         '  callback_poll            every %ds\n'
         '  fill_monitor             every %ds\n'
-        '  resolution               every %dmin',
+        '  resolution               every %dmin\n'
+        '  longshot_score           every %dmin\n'
+        '  longshot_digest          every %dmin',
         SCAN_INTERVAL_MINUTES,
         PRICE_REFRESH_SECONDS,
         ALERT_CHECK_SECONDS,
         CALLBACK_POLL_SECONDS,
         FILL_MONITOR_SECONDS,
         RESOLUTION_CHECK_MINUTES,
+        LONGSHOT_SCORE_INTERVAL_MINUTES,
+        LONGSHOT_DIGEST_INTERVAL_MINUTES,
     )
     scheduler.start()
 

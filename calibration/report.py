@@ -111,6 +111,27 @@ def build_report() -> str:
         '<i>Negative Δ = under-performed (LLM may be over-confident → lower LLM_WEIGHT)</i>',
     ]
 
+    # Strategy breakdown
+    strategy_rows = db.fetchall("""
+        SELECT strategy,
+               COUNT(*) FILTER (WHERE won IS NOT NULL) AS resolved,
+               COUNT(*) FILTER (WHERE won = TRUE)      AS wins
+        FROM mention_trades
+        GROUP BY strategy
+        ORDER BY strategy
+    """)
+    if strategy_rows:
+        lines += ['', '<b>By strategy</b>',
+                  '<code>Strategy              Resolved  Wins  Win%</code>']
+        for s in strategy_rows:
+            resolved = int(s.get('resolved') or 0)
+            wins     = int(s.get('wins') or 0)
+            win_pct  = wins / resolved * 100 if resolved else 0
+            name     = (s.get('strategy') or 'unknown')[:22]
+            lines.append(
+                f'<code>{name:<22} {resolved:>8}  {wins:>4}  {win_pct:>4.0f}%</code>'
+            )
+
     return '\n'.join(lines)
 
 
