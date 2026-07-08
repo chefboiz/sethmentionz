@@ -104,10 +104,17 @@ def _handle_y(opp: dict, amount: float, chat_id: str) -> None:
 
     try:
         from edge.executor import place_order
+        from edge.clob_client import fetch_price as _fetch_price
+        live_ask = _fetch_price(clob_ids[0], side='BUY')
+        if live_ask is None:
+            live_ask = best_ask
+            log.warning('Could not fetch live price for %s -- using cached %.3f', market_id[:14], best_ask)
+        elif abs(live_ask - best_ask) > 0.02:
+            log.info('Price moved since alert: %.3f -> %.3f for %s', best_ask, live_ask, market_id[:14])
         result      = place_order(
             token_id=clob_ids[0],
             size_usd=amount,
-            best_ask=best_ask,
+            best_ask=live_ask,
             blended_confidence=confidence,
         )
         order_id    = result['order_id']
