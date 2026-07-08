@@ -6,11 +6,14 @@ import httpx
 import db
 import trading_state
 from config import TELEGRAM_BOT_TOKEN
+from telegram import queue_state
 from telegram.alerts import (
     get_open_opportunity,
+    get_opportunity_by_id,
     advance_queue,
     skip_opp,
     resolve_dt_str,
+    format_alert,
 )
 
 log = logging.getLogger(__name__)
@@ -159,6 +162,59 @@ def _handle_d(opp: dict, chat_id: str) -> None:
     _send(chat_id, f'📄 Description\n\n{body}')
 
 
+def _handle_r(opp: dict, chat_id: str) -> None:
+    """Re-fetch live price/edge for the currently open opportunity and resend the card."""
+    from edge.clob_client import fetch_price, fetch_book
+    from edge.calculator import compute
+
+    market_id = opp['market_id']
+    clob_ids  = opp.get('clob_token_ids') or []
+    blended   = float(opp.get('blended_confidence') or 0)
+
+    if not clob_ids:
+        _send(chat_id, '⚠️ No token ID on record — cannot refresh.')
+        return
+
+    best_ask = fetch_price(clob_ids[0], side='BUY')
+    if best_ask is None:
+        _send(chat_id, '⚠️ Could not fetch live price — try again shortly.')
+        return
+
+    book = fetch_book(clob_ids[0])
+    if not book:
+        _send(chat_id, '⚠️ Could not fetch order book — try again shortly.')
+        return
+
+    result, reason = compute(book, blended, best_ask)
+
+    if result is None:
+        # No longer qualifies — auto-skip and advance
+        q = (opp.get('question') or market_id)[:60]
+        log.info('Refresh disqualified %s: %s', market_id[:14], reason)
+        skip_opp(market_id)
+        _send(chat_id, f'⏭ Refreshed — no longer qualifies ({reason})\nSkipping "{q}".')
+        advance_queue()
+        return
+
+    # Update the DB row with fresh numbers
+    db.execute("""
+        UPDATE mention_opportunities SET
+            best_ask        = %(best_ask)s,
+            edge_pct        = %(edge_pct)s,
+            max_size_usd    = %(max_size_usd)s,
+            total_depth_usd = %(total_depth_usd)s,
+            liquidity_flag  = %(liquidity_flag)s,
+            last_price_check_at = %(now)s
+        WHERE market_id = %(market_id)s
+    """, {**result, 'now': datetime.now(timezone.utc).isoformat(), 'market_id': market_id})
+
+    # Resend alert card with updated numbers
+    updated_opp = {**opp, **result}
+    _send(chat_id, format_alert(updated_opp, refreshed=True))
+    log.info('Refreshed alert: %s  ask=%.3f  edge=+%.1f%%',
+             market_id[:14], result['best_ask'], result['edge_pct'] * 100)
+
+
 def _handle_command(cmd: str, chat_id: str) -> None:
     if cmd == '/pause':
         trading_state.pause()
@@ -191,7 +247,6 @@ def _handle_b(text: str, chat_id: str) -> None:
     row_side_str = parts[1]
     amount_str   = parts[2]
 
-    # Parse row number and side character ('c' = cheap, 'e' = expensive)
     side_char = ''
     row_str   = row_side_str
     if row_side_str and row_side_str[-1] in ('c', 'e'):
@@ -224,7 +279,6 @@ def _handle_b(text: str, chat_id: str) -> None:
         trade_side  = exp_side
         trade_price = float(row.get('expensive_price') or 0)
     else:
-        # 'c' or no side char → cheap side
         trade_side  = cheap_side
         trade_price = float(row.get('cheap_price') or 0)
 
@@ -232,8 +286,8 @@ def _handle_b(text: str, chat_id: str) -> None:
         _send(chat_id, 'No valid price for that row — try after the next scorer run.')
         return
 
-    clob_ids  = row.get('clob_token_ids') or []
-    token_idx = 0 if trade_side.lower() == 'yes' else 1
+    clob_ids   = row.get('clob_token_ids') or []
+    token_idx  = 0 if trade_side.lower() == 'yes' else 1
     clob_token = clob_ids[token_idx] if token_idx < len(clob_ids) else None
 
     question = (row.get('question') or mid)[:60]
@@ -288,8 +342,6 @@ def _handle_longshot_confirm(chat_id: str) -> None:
 
     try:
         from edge.executor import place_order
-        # Pass composite_score as blended_confidence; limit price will be price + slippage
-        # since composite (0–1) >> price ceiling for cheap-side longshots
         result      = place_order(
             token_id=clob_token,
             size_usd=amount,
@@ -324,6 +376,44 @@ def _handle_longshot_confirm(chat_id: str) -> None:
 
 # ── Message dispatcher ────────────────────────────────────────────────────────
 
+def _resolve_open_opp(chat_id: str) -> dict | None:
+    """
+    Return the currently open opportunity, bound to the specific market_id that
+    was last alerted.  Handles three cases:
+
+    1. queue_state has a market_id → fetch that specific row.
+       If it's no longer pending+alerted (expired, skipped, approved between alert
+       and reply), warn the user and return None.
+    2. queue_state is empty (process restart) → fall back to DB query with ORDER BY
+       to get a deterministic row; self-heal queue_state from it.
+    3. Nothing open at all → return None.
+    """
+    mid = queue_state.get()
+
+    if mid:
+        opp = get_opportunity_by_id(mid)
+        if not opp:
+            log.warning('queue_state had %s but row not found — clearing', mid[:14])
+            queue_state.set_open(None)
+            _send(chat_id, '⚠️ The tracked opportunity no longer exists. '
+                           'Queue state cleared — next alert coming shortly.')
+            return None
+        if opp.get('status') != 'pending' or not opp.get('alerted'):
+            log.warning('queue_state %s is %s/alerted=%s — stale, clearing',
+                        mid[:14], opp.get('status'), opp.get('alerted'))
+            queue_state.set_open(None)
+            _send(chat_id, f'⚠️ That trade ({opp.get("question","")[:40]}…) '
+                           f'is no longer open (status: {opp.get("status")}). '
+                           f'Advancing queue.')
+            advance_queue()
+            return None
+        return opp
+
+    # Startup/restart recovery path
+    opp = get_open_opportunity()  # also sets queue_state as a side effect
+    return opp
+
+
 def _handle_message(update: dict) -> None:
     msg     = update.get('message', {})
     chat_id = str(msg.get('chat', {}).get('id', ''))
@@ -353,10 +443,11 @@ def _handle_message(update: dict) -> None:
             _send(chat_id, '❌ Longshot trade cancelled.')
             return
 
-    # LLM queue handlers
-    opp = get_open_opportunity()
+    # LLM queue handlers — resolve against the SPECIFIC open opportunity
+    opp = _resolve_open_opp(chat_id)
     if opp is None:
-        _send(chat_id, 'No open trade right now.')
+        if token not in ('y', 'n', 'w', 'd', 'r'):
+            _send(chat_id, 'No open trade right now.')
         return
 
     if token == 'y':
@@ -370,7 +461,7 @@ def _handle_message(update: dict) -> None:
                 return
             except ValueError:
                 pass
-        _send(chat_id, "didn't catch that — reply y [amount], n, w, or d")
+        _send(chat_id, "didn't catch that — reply y [amount], n, w, d, or r")
 
     elif token == 'n':
         _handle_n(opp, chat_id)
@@ -381,8 +472,11 @@ def _handle_message(update: dict) -> None:
     elif token == 'd':
         _handle_d(opp, chat_id)
 
+    elif token in ('r', 'refresh'):
+        _handle_r(opp, chat_id)
+
     else:
-        _send(chat_id, "didn't catch that — reply y [amount], n, w, or d")
+        _send(chat_id, "didn't catch that — reply y [amount], n, w, d, or r")
 
 
 # ── APScheduler job ───────────────────────────────────────────────────────────

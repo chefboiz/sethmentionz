@@ -5,6 +5,7 @@ import httpx
 
 import db
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from telegram import queue_state
 
 log = logging.getLogger(__name__)
 
@@ -13,28 +14,52 @@ REALERT_THRESHOLD = 0.02
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
+_OPP_COLUMNS = """
+    mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
+    mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag, mo.status,
+    mm.question, mm.subject, mm.context, mm.phrase_topic,
+    mm.resolution_deadline, mm.resolution_criteria_summary,
+    mm.description, mm.clob_token_ids
+"""
+
+
 def get_open_opportunity() -> dict | None:
     """Return the currently open (awaiting reply) opportunity, or None.
-    Open = status 'pending' + alerted TRUE (alert was sent, reply not yet received)."""
-    return db.fetchone("""
-        SELECT mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
-               mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag, mo.status,
-               mm.question, mm.subject, mm.context, mm.phrase_topic,
-               mm.resolution_deadline, mm.resolution_criteria_summary,
-               mm.description, mm.clob_token_ids
+    Open = status 'pending' + alerted TRUE (alert was sent, reply not yet received).
+    Uses the queue_state market_id when available so the result is always the
+    specific market that was last alerted, not an arbitrary pending row."""
+    mid = queue_state.get()
+    if mid:
+        return get_opportunity_by_id(mid)
+    # Fallback for startup recovery (queue_state cleared by process restart)
+    row = db.fetchone(f"""
+        SELECT {_OPP_COLUMNS}
         FROM mention_opportunities mo
         JOIN mention_markets mm ON mm.market_id = mo.market_id
         WHERE mo.status = 'pending' AND mo.alerted = TRUE
+        ORDER BY mo.qualified_at ASC
+        LIMIT 1
     """)
+    if row:
+        log.warning('queue_state recovered from DB: %s', row['market_id'][:14])
+        queue_state.set_open(row['market_id'])
+    return row
+
+
+def get_opportunity_by_id(market_id: str) -> dict | None:
+    """Fetch a specific opportunity by market_id regardless of status."""
+    return db.fetchone(f"""
+        SELECT {_OPP_COLUMNS}
+        FROM mention_opportunities mo
+        JOIN mention_markets mm ON mm.market_id = mo.market_id
+        WHERE mo.market_id = %s
+    """, (market_id,))
 
 
 def _get_next_queued() -> dict | None:
     """Next pending+unalerted opportunity ordered by when it qualified."""
-    return db.fetchone("""
-        SELECT mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
-               mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag,
-               mm.question, mm.subject, mm.context, mm.phrase_topic,
-               mm.resolution_deadline, mm.clob_token_ids
+    return db.fetchone(f"""
+        SELECT {_OPP_COLUMNS}
         FROM mention_opportunities mo
         JOIN mention_markets mm ON mm.market_id = mo.market_id
         WHERE mo.status = 'pending' AND mo.alerted = FALSE
@@ -81,7 +106,7 @@ def resolve_dt_str(iso) -> str:
         return str(iso)[:16]
 
 
-def format_alert(opp: dict) -> str:
+def format_alert(opp: dict, refreshed: bool = False) -> str:
     q       = opp.get('question') or '—'
     subject = opp.get('subject') or '—'
     ctx     = opp.get('context') or '—'
@@ -91,9 +116,10 @@ def format_alert(opp: dict) -> str:
     until   = _hours_until(opp.get('resolution_deadline'))
     thin    = opp.get('liquidity_flag', False)
     depth   = float(opp.get('total_depth_usd') or 0)
+    suffix  = ' (refreshed)' if refreshed else ''
 
     lines = [
-        f'🎯 Trade Found — 🟢 YES · "{q}"',
+        f'🎯 Trade Found — 🟢 YES · "{q}"{suffix}',
         '',
         f'👤 Who: {subject}',
         f'📍 Where: {ctx}',
@@ -105,7 +131,7 @@ def format_alert(opp: dict) -> str:
     ]
     if thin:
         lines.append(f'⚠️  Thin book — ${depth:.0f} total depth')
-    lines += ['', 'Reply: y [amount] / n / w / d']
+    lines += ['', 'Reply: y [amount] / n / w / d / r']
     return '\n'.join(lines)
 
 
@@ -163,6 +189,7 @@ def _open_opp(opp: dict) -> None:
         'tg_message_id':      msg_id,
         'market_id':          mid,
     })
+    queue_state.set_open(mid)
     log.info('Opened: %s', mid[:14])
 
 
@@ -173,6 +200,7 @@ def advance_queue() -> None:
     if nxt:
         _open_opp(nxt)
     else:
+        queue_state.set_open(None)
         log.info('Queue empty — nothing to advance to')
 
 
@@ -197,6 +225,9 @@ def run_alert_check() -> None:
             UPDATE mention_opportunities SET tg_message_id = NULL
             WHERE market_id = %s
         """, (expired_open['market_id'],))
+        # Clear queue_state if this was the tracked open slot
+        if queue_state.get() == expired_open['market_id']:
+            queue_state.set_open(None)
 
     # 2. If something is still open and pending, wait for the user's reply.
     if get_open_opportunity():
