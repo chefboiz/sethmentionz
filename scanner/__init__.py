@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 
 from psycopg2.extras import Json
@@ -10,6 +11,13 @@ from scanner.mention_filter import is_mention_market
 from scanner.extractor import extract_fields
 
 log = logging.getLogger(__name__)
+
+# Reality TV / entertainment show markets — inverted CLOB books, never qualify
+_BLOCKED_SHOW_RE = re.compile(
+    r'love island|big brother|the bachelor|the bachelorette|survivor|'
+    r'dancing with the stars|the voice|american idol|x factor|got talent',
+    re.I,
+)
 
 
 def _within_window(end_date: str | None) -> bool:
@@ -36,6 +44,10 @@ def run_scan() -> None:
     for market in in_window:
         question    = market.get('question', '')
         description = market.get('description', '') or ''
+
+        if _BLOCKED_SHOW_RE.search(question):
+            log.debug('  blocked (show): %s', question[:80])
+            continue
 
         if not is_mention_market(question, description):
             continue
