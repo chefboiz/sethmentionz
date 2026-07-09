@@ -120,9 +120,16 @@ def run_longshot_digest() -> None:
         WHERE mm.resolved = FALSE AND mm.archived = FALSE
           AND lc.composite_score IS NOT NULL
           AND lc.llm_probability >= %(min_conf)s
+          AND (lc.pending_confirmation_at IS NULL
+               OR lc.pending_confirmation_at <= NOW() - INTERVAL '2 hours')
+          AND lc.market_id NOT IN (
+              SELECT market_id FROM mention_trades
+              WHERE strategy = 'longshot_momentum'
+                AND status IN ('approved', 'approved_dry_run')
+          )
         ORDER BY lc.composite_score DESC
-        LIMIT 5""", {'min_conf': LONGSHOT_MIN_CONFIDENCE}
-    """)
+        LIMIT 5
+    """, {'min_conf': LONGSHOT_MIN_CONFIDENCE})
 
     if not rows:
         log.info('Longshot digest: no scored candidates')
