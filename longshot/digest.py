@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import httpx
 
 import db
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LONGSHOT_MIN_CONFIDENCE
 
 log = logging.getLogger(__name__)
 
@@ -68,11 +68,14 @@ def _format_digest(rows: list[dict]) -> str:
         hours       = float(r.get('hours_to_resolution') or 0)
         comp        = float(r.get('composite_score') or 0) * 100
 
+        llm_prob    = r.get('llm_probability')
+        llm_str     = f'{float(llm_prob)*100:.0f}%' if llm_prob is not None else 'n/a'
+
         lines += [
             f'{num} "{question}"{marker_str}',
             f'   Cheap: {cheap_side} @ ${cheap_price:.2f} | Exp: ${exp_price:.2f}',
             f'   24h: {pch_str} | Vol: {vol_str} | Resolves: {hours:.0f}h',
-            f'   Score: {comp:.0f}/100',
+            f'   Score: {comp:.0f}/100 | LLM: {llm_str}',
             '',
         ]
 
@@ -110,14 +113,15 @@ def run_longshot_digest() -> None:
         SELECT lc.market_id, lc.cheap_side, lc.cheap_price, lc.expensive_price,
                lc.price_change_24h_pct, lc.volume_24h, lc.hours_to_resolution,
                lc.momentum_score, lc.volume_score, lc.time_score,
-               lc.composite_score, lc.subject,
+               lc.composite_score, lc.llm_probability, lc.subject,
                mm.question, mm.clob_token_ids
         FROM mention_longshot_candidates lc
         JOIN mention_markets mm ON mm.market_id = lc.market_id
         WHERE mm.resolved = FALSE AND mm.archived = FALSE
           AND lc.composite_score IS NOT NULL
+          AND lc.llm_probability >= %(min_conf)s
         ORDER BY lc.composite_score DESC
-        LIMIT 5
+        LIMIT 5""", {'min_conf': LONGSHOT_MIN_CONFIDENCE}
     """)
 
     if not rows:
