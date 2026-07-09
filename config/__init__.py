@@ -42,7 +42,8 @@ RESOLUTION_CHECK_MINUTES      = int(os.getenv('RESOLUTION_CHECK_MINUTES', '15'))
 
 # Phase 7 — Longshot momentum scanner
 LONGSHOT_MIN_DEPTH_USD         = float(os.getenv('LONGSHOT_MIN_DEPTH_USD', '100'))
-LONGSHOT_MAX_PRICE             = float(os.getenv('LONGSHOT_MAX_PRICE', '0.25'))
+LONGSHOT_MAX_PRICE             = float(os.getenv('LONGSHOT_MAX_PRICE', '0.40'))
+LONGSHOT_MIN_CONFIDENCE        = float(os.getenv('LONGSHOT_MIN_CONFIDENCE', '0.20'))
 LONGSHOT_SCORE_INTERVAL_MINUTES = int(os.getenv('LONGSHOT_SCORE_INTERVAL_MINUTES', '15'))
 LONGSHOT_DIGEST_INTERVAL_MINUTES = int(os.getenv('LONGSHOT_DIGEST_INTERVAL_MINUTES', '15'))
 MOMENTUM_WEIGHT               = float(os.getenv('MOMENTUM_WEIGHT', '0.40'))
