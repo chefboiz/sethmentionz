@@ -311,6 +311,11 @@ def _handle_b(text: str, chat_id: str) -> None:
         'composite':  float(row.get('composite_score') or 0),
     }
 
+    db.execute("""
+        UPDATE mention_longshot_candidates SET pending_confirmation_at = NOW()
+        WHERE market_id = %s
+    """, (mid,))
+
     _send(chat_id,
           f'Confirm: BUY {trade_side.upper()} · "{question}"\n'
           f'Amount: ${amount:.0f} @ ${trade_price:.2f}\n'
@@ -324,6 +329,11 @@ def _handle_longshot_confirm(chat_id: str) -> None:
     _state['longshot_pending'] = None
 
     mid        = pending['market_id']
+
+    db.execute("""
+        UPDATE mention_longshot_candidates SET pending_confirmation_at = NULL
+        WHERE market_id = %s
+    """, (mid,))
     side       = pending['side']
     price      = pending['price']
     amount     = pending['amount']
@@ -446,7 +456,12 @@ def _handle_message(update: dict) -> None:
             _handle_longshot_confirm(chat_id)
             return
         elif token == 'n':
+            cancelled_mid = _state['longshot_pending']['market_id']
             _state['longshot_pending'] = None
+            db.execute("""
+                UPDATE mention_longshot_candidates SET pending_confirmation_at = NULL
+                WHERE market_id = %s
+            """, (cancelled_mid,))
             _send(chat_id, '❌ Longshot trade cancelled.')
             return
 
