@@ -38,13 +38,16 @@ def _resolve_from_prices(outcomes: list[str], prices: list[float]) -> str | None
 
 
 def _fetch_market(market_id: str) -> dict | None:
+    # The /markets/{id} path form only accepts Gamma's internal numeric id and
+    # returns 422 for a conditionId once the market is archived. The list form
+    # with condition_ids works for both open and archived/closed markets.
     try:
         with httpx.Client(timeout=10) as c:
-            r = c.get(f'{POLYMARKET_API_URL}/markets/{market_id}')
-            if r.status_code == 404:
-                return None
+            r = c.get(f'{POLYMARKET_API_URL}/markets',
+                      params={'condition_ids': market_id, 'closed': 'true'})
             r.raise_for_status()
-            return r.json()
+            results = r.json()
+            return results[0] if results else None
     except Exception as e:
         log.warning('Gamma fetch failed for %s: %s', market_id[:14], e)
         return None
