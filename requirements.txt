@@ -4,4 +4,4 @@ python-dotenv==1.0.1
 apscheduler==3.10.4
 anthropic==0.34.2
 newsapi-python==0.2.7
-py-clob-client @ git+https://github.com/Polymarket/py-clob-client.git
+polymarket-client==0.1.0b18

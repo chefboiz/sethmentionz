@@ -31,9 +31,6 @@ POLYMARKET_API_URL       = 'https://gamma-api.polymarket.com'
 # Execution (Phase 5)
 POLYMARKET_PRIVATE_KEY   = os.getenv('POLYMARKET_PRIVATE_KEY', '')
 POLYMARKET_PROXY_ADDRESS = os.getenv('POLYMARKET_PROXY_ADDRESS', '')
-POLY_API_KEY             = os.getenv('POLY_API_KEY', '')
-POLY_API_SECRET          = os.getenv('POLY_API_SECRET', '')
-POLY_API_PASSPHRASE      = os.getenv('POLY_API_PASSPHRASE', '')
 
 SLIPPAGE_TOLERANCE       = float(os.getenv('SLIPPAGE_TOLERANCE', '0.01'))
 FILL_TIMEOUT_MINUTES     = int(os.getenv('FILL_TIMEOUT_MINUTES', '10'))
