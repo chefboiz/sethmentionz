@@ -28,8 +28,8 @@ from edge.fill_monitor import run_fill_monitor
 from resolution.tracker import run_resolution_check
 from telegram.alerts import run_alert_check
 from telegram.callbacks import run_callback_poll
-from longshot.scorer import run_longshot_score
-from longshot.digest import run_longshot_digest
+# from longshot.scorer import run_longshot_score
+# from longshot.digest import run_longshot_digest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,14 +92,14 @@ def main() -> None:
                       next_run_time=now + timedelta(minutes=6))
 
     # ── Phase 7 — longshot scorer ────────────────────────────────────────────
-    scheduler.add_job(run_longshot_score, 'interval',
-                      minutes=LONGSHOT_SCORE_INTERVAL_MINUTES, id='longshot_score',
-                      next_run_time=now + timedelta(minutes=7))
+    # scheduler.add_job(run_longshot_score, 'interval',
+    #                   minutes=LONGSHOT_SCORE_INTERVAL_MINUTES, id='longshot_score',
+    #                   next_run_time=now + timedelta(minutes=7))
 
     # ── Phase 7 — longshot digest ────────────────────────────────────────────
-    scheduler.add_job(run_longshot_digest, 'interval',
-                      minutes=LONGSHOT_DIGEST_INTERVAL_MINUTES, id='longshot_digest',
-                      next_run_time=now + timedelta(minutes=8))
+    # scheduler.add_job(run_longshot_digest, 'interval',
+    #                   minutes=LONGSHOT_DIGEST_INTERVAL_MINUTES, id='longshot_digest',
+    #                   next_run_time=now + timedelta(minutes=8))
 
     # ── Phase 6 — error alerting ──────────────────────────────────────────────
     monitoring.register(scheduler)

@@ -16,7 +16,7 @@ REALERT_THRESHOLD = 0.02
 
 _OPP_COLUMNS = """
     mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
-    mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag, mo.status,
+    mo.max_size_usd, mo.total_depth_usd, mo.liquidity_flag, mo.status, mo.alerted,
     mm.question, mm.subject, mm.context, mm.phrase_topic,
     mm.resolution_deadline, mm.resolution_criteria_summary,
     mm.description, mm.clob_token_ids
@@ -26,11 +26,20 @@ _OPP_COLUMNS = """
 def get_open_opportunity() -> dict | None:
     """Return the currently open (awaiting reply) opportunity, or None.
     Open = status 'pending' + alerted TRUE (alert was sent, reply not yet received).
-    Uses the queue_state market_id when available so the result is always the
-    specific market that was last alerted, not an arbitrary pending row."""
+    Stale queue_state entries (expired/skipped markets) are cleared automatically."""
     mid = queue_state.get()
     if mid:
-        return get_opportunity_by_id(mid)
+        opp = get_opportunity_by_id(mid)
+        if opp and opp.get('status') == 'pending':
+            return opp
+        # Stale: market was resolved/expired without queue_state being cleared
+        if opp:
+            log.warning('queue_state %s is stale (status=%s) -- clearing',
+                        mid[:14], opp.get('status'))
+        else:
+            log.warning('queue_state %s not found in DB -- clearing', mid[:14])
+        queue_state.set_open(None)
+        return None
     # Fallback for startup recovery (queue_state cleared by process restart)
     row = db.fetchone(f"""
         SELECT {_OPP_COLUMNS}

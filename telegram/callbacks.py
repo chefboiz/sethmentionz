@@ -14,6 +14,7 @@ from telegram.alerts import (
     skip_opp,
     resolve_dt_str,
     format_alert,
+    _open_opp,
 )
 
 log = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ log = logging.getLogger(__name__)
 _state: dict = {
     'last_update_id':    0,
     'longshot_pending':  None,  # set by _handle_b, cleared by y/n
+    'analysis_rows':     [],    # set by _handle_analyze, resolved by _handle_pick
 }
 
 
@@ -111,11 +113,13 @@ def _handle_y(opp: dict, amount: float, chat_id: str) -> None:
             log.warning('Could not fetch live price for %s -- using cached %.3f', market_id[:14], best_ask)
         elif abs(live_ask - best_ask) > 0.02:
             log.info('Price moved since alert: %.3f -> %.3f for %s', best_ask, live_ask, market_id[:14])
+        live_payout = round(amount / live_ask, 2) if live_ask else payout
         result      = place_order(
             token_id=clob_ids[0],
             size_usd=amount,
             best_ask=live_ask,
             blended_confidence=confidence,
+            force=True,
         )
         order_id    = result['order_id']
         limit_price = result['limit_price']
@@ -127,11 +131,7 @@ def _handle_y(opp: dict, amount: float, chat_id: str) -> None:
             SET status = 'approved'
             WHERE market_id = %s
         """, (market_id,))
-        _send(chat_id,
-              f'✅ Trade Placed — 🟢 YES · "{q}"\n\n'
-              f'💵 Amount: ${amount:.0f}\n'
-              f'📈 To return: ${payout:.2f}\n'
-              f'⏱ Resolves: {resolve_str}')
+        _send(chat_id, f'⏳ Buying ${amount:.0f} YES — fill notification incoming')
         log.info('Order placed: %s  $%.0f @ %.3f', market_id[:14], amount, limit_price)
 
     except Exception as e:
@@ -230,10 +230,12 @@ def _handle_command(cmd: str, chat_id: str) -> None:
         trading_state.resume()
         _send(chat_id, '▶️ Trading resumed.')
     elif cmd == '/status':
-        state = '⏸ PAUSED' if trading_state.is_paused() else '▶️ LIVE'
-        opp   = get_open_opportunity()
-        q     = f'\n\nOpen trade: "{(opp.get("question") or "")[:60]}"' if opp else ''
-        _send(chat_id, f'Trading state: {state}{q}')
+        import analysis_state
+        state    = '⏸ PAUSED' if trading_state.is_paused() else '▶️ LIVE'
+        an_state = '⏸ paused (text "analyze" to run)' if analysis_state.is_paused() else '▶️ running'
+        opp      = get_open_opportunity()
+        q        = f'\n\nOpen trade: "{(opp.get("question") or "")[:60]}"' if opp else ''
+        _send(chat_id, f'Trading state: {state}\nAnalysis: {an_state}{q}')
     elif cmd == '/calibration':
         from calibration.report import get_chunks
         for chunk in get_chunks():
@@ -391,6 +393,90 @@ def _handle_longshot_confirm(chat_id: str) -> None:
         _send(chat_id, f'⚠️ Execution failed — dry-run logged\n{str(e)[:200]}')
 
 
+# ── On-demand analysis (pause/resume LLM spend) ────────────────────────────────
+
+def _handle_analyze(chat_id: str) -> None:
+    """One-shot: score every pending market with the LLM, compute edge, show the
+    top picks, then re-pause so no further Sonnet calls happen automatically."""
+    import analysis_state
+    from confidence import score_pending_markets
+    from edge import run_edge
+
+    _send(chat_id, '🔍 Analyzing pending markets — this may take a minute…')
+
+    analysis_state.resume()
+    try:
+        score_pending_markets()
+        run_edge()
+    finally:
+        analysis_state.pause()
+
+    rows = db.fetchall("""
+        SELECT mo.market_id, mo.blended_confidence, mo.edge_pct, mo.best_ask,
+               mo.liquidity_flag, mm.question
+        FROM mention_opportunities mo
+        JOIN mention_markets mm ON mm.market_id = mo.market_id
+        WHERE mo.status = 'pending'
+        ORDER BY mo.edge_pct DESC
+        LIMIT 5
+    """)
+
+    if not rows:
+        _send(chat_id, 'Analysis complete — no qualifying opportunities right now.')
+        return
+
+    _state['analysis_rows'] = list(rows)
+
+    lines = ['📊 Analysis — Top picks', '']
+    for i, r in enumerate(rows, start=1):
+        q    = (r.get('question') or r['market_id'])[:60]
+        conf = float(r.get('blended_confidence') or 0) * 100
+        edge = float(r.get('edge_pct') or 0) * 100
+        ask  = float(r.get('best_ask') or 0)
+        thin = '  THIN' if r.get('liquidity_flag') else ''
+        lines += [
+            f'{i}. "{q}"',
+            f'   conf={conf:.0f}%  edge=+{edge:.1f}%  ask=${ask:.2f}{thin}',
+            '',
+        ]
+    lines.append('Reply "pick {row}" to open that trade for approval (e.g. "pick 1").')
+    _send(chat_id, '\n'.join(lines))
+    log.info('Analysis digest sent: %d candidate(s)', len(rows))
+
+
+def _handle_pick(text: str, chat_id: str) -> None:
+    """Handle `pick {row}` — opens the chosen analysis row for the usual y/n/w/d/r approval."""
+    parts = text.split()
+    if len(parts) < 2:
+        _send(chat_id, 'Format: pick {row}  e.g. "pick 1"')
+        return
+    try:
+        row_num = int(parts[1])
+    except ValueError:
+        _send(chat_id, 'Format: pick {row}  e.g. "pick 1"')
+        return
+
+    rows = _state.get('analysis_rows') or []
+    if not rows:
+        _send(chat_id, 'No current analysis — text "analyze" first.')
+        return
+    if row_num < 1 or row_num > len(rows):
+        _send(chat_id, f'Only {len(rows)} rows in the last analysis.')
+        return
+
+    if queue_state.get():
+        _send(chat_id, 'You already have an open trade awaiting a reply — resolve it (y/n/w/d/r) first.')
+        return
+
+    mid = rows[row_num - 1]['market_id']
+    opp = get_opportunity_by_id(mid)
+    if not opp or opp.get('status') != 'pending':
+        _send(chat_id, 'That opportunity is no longer available — text "analyze" again.')
+        return
+
+    _open_opp(opp)
+
+
 # ── Message dispatcher ────────────────────────────────────────────────────────
 
 def _resolve_open_opp(chat_id: str) -> dict | None:
@@ -416,14 +502,10 @@ def _resolve_open_opp(chat_id: str) -> dict | None:
                            'Queue state cleared — next alert coming shortly.')
             return None
         if opp.get('status') != 'pending' or not opp.get('alerted'):
-            log.warning('queue_state %s is %s/alerted=%s — stale, clearing',
+            log.warning('queue_state %s is %s/alerted=%s — expired, offering force buy',
                         mid[:14], opp.get('status'), opp.get('alerted'))
-            queue_state.set_open(None)
-            _send(chat_id, f'⚠️ That trade ({opp.get("question","")[:40]}…) '
-                           f'is no longer open (status: {opp.get("status")}). '
-                           f'Advancing queue.')
-            advance_queue()
-            return None
+            _send(chat_id, 'Trade expired (no edge) - reply y [amount] to buy at live price, or n to skip.')
+            return opp
         return opp
 
     # Startup/restart recovery path
@@ -444,6 +526,14 @@ def _handle_message(update: dict) -> None:
         return
 
     token = text.lower().split()[0]
+
+    # On-demand batch analysis (pause/resume LLM spend)
+    if token == 'analyze':
+        _handle_analyze(chat_id)
+        return
+    if token == 'pick':
+        _handle_pick(text.lower(), chat_id)
+        return
 
     # Longshot buy intent
     if token == 'b':

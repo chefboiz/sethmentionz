@@ -14,9 +14,11 @@ def run_fill_monitor() -> None:
     now_iso = now.isoformat()
 
     trades = db.fetchall("""
-        SELECT id, market_id, order_id, size_usd, limit_price, approved_at
-        FROM mention_trades
-        WHERE status = 'approved' AND order_id IS NOT NULL
+        SELECT t.id, t.market_id, t.order_id, t.size_usd, t.limit_price, t.approved_at,
+               mm.question
+        FROM mention_trades t
+        LEFT JOIN mention_markets mm ON mm.market_id = t.market_id
+        WHERE t.status = 'approved' AND t.order_id IS NOT NULL
     """)
 
     if not trades:
@@ -57,10 +59,10 @@ def run_fill_monitor() -> None:
 
             log.info('Filled: trade=%s  %.2f shares @ %.4f  ($%.2f)',
                      trade_id, matched, avg_px, fill_usd)
+            q_short = (trade.get('question') or market_id)[:60]
             tg.send_message(
-                f'✅ <b>Order filled</b>\n'
-                f'Market: <code>{market_id[:16]}</code>\n'
-                f'{matched:.2f} shares @ {avg_px:.4f}  ≈ <b>${fill_usd:.0f}</b>'
+                'Filled: ' + q_short + chr(10)
+                + f'${fill_usd:.0f} ({matched:.2f} shares @ ${avg_px:.4f})'
             )
 
         elif status == 'canceled':

@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
 
+import analysis_state
 import db
 from config import LLM_WEIGHT, SIGNAL_WEIGHT, CONFIDENCE_THRESHOLD
 from confidence.llm_leg import score as llm_score_fn
@@ -19,6 +20,15 @@ def _get_signal_source():
 
 
 def run_confidence() -> None:
+    """Scheduled job — no-op while analysis is paused, so no LLM spend happens
+    automatically. See analysis_state.py and telegram/callbacks.py `analyze`."""
+    if analysis_state.is_paused():
+        log.debug('Confidence run skipped — analysis paused')
+        return
+    score_pending_markets()
+
+
+def score_pending_markets() -> None:
     log.info('=== Confidence run started ===')
 
     markets = db.fetchall("""
